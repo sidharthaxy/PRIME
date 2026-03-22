@@ -10,6 +10,35 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 // import { getAnalytics } from "firebase/analytics";
 // import { getFunctions } from 'firebase/functions';
 
+export interface Reading {
+  deviceId: string;
+  ownerId: string;
+  voltage: number;
+  current: number;
+  power: number;
+  energy: number;
+  status: 0 | 1 | 2;
+  timestamp: { seconds: number; nanoseconds: number };
+}
+
+export interface DeviceDoc {
+  deviceId: string;
+  ownerId: string | null;
+  name: string;
+  paired: boolean;
+  pairedAt: { seconds: number };
+  status: 'online' | 'offline';
+  lastSeen: { seconds: number };
+}
+
+export interface PairingSession {
+  deviceId: string;
+  token: string;
+  name: string;
+  expiresAt: { seconds: number };
+  claimed: boolean;
+}
+
 const firebaseConfig = {
     apiKey: process.env.EXPO_PUBLIC_FIREBASE_API_KEY || "demo-api-key",
     authDomain: process.env.EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN || "demo-project.firebaseapp.com",
@@ -58,3 +87,26 @@ if (__DEV__) {
 }
 
 export { auth, db };
+
+import { getFunctions, httpsCallable } from 'firebase/functions';
+const functions = getFunctions(app);
+
+export const callPairDevice = httpsCallable<
+  { deviceId: string; token: string; name: string },
+  { success: boolean; device: { deviceId: string; name: string } }
+>(functions, 'pairDevice');
+
+export const callUnpairDevice = httpsCallable<
+  { deviceId: string },
+  { success: boolean }
+>(functions, 'unpairDevice');
+
+export const callVerifyDeviceOwner = httpsCallable<
+  { deviceId: string },
+  { isOwner: boolean }
+>(functions, 'verifyDeviceOwner');
+
+export const callGetDeviceReadings = httpsCallable<
+  { deviceId: string; limit?: number; fromTimestamp?: number; toTimestamp?: number },
+  { readings: Reading[] }
+>(functions, 'getDeviceReadings');

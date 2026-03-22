@@ -1,32 +1,42 @@
-import React, { useEffect, useState } from 'react';
-import { Redirect } from 'expo-router';
-import { onAuthStateChanged, User } from 'firebase/auth';
+import { useEffect, useState } from 'react';
+import { View, ActivityIndicator, StyleSheet } from 'react-native';
+import { useRouter } from 'expo-router';
+import { onAuthStateChanged } from 'firebase/auth';
 import { auth } from '../src/config/firebase';
-import { View, ActivityIndicator } from 'react-native';
 
-export default function Index() {
-    const [user, setUser] = useState<User | null>(null);
-    const [loading, setLoading] = useState(true);
+export default function IndexRoute() {
+  const router = useRouter();
+  const [loading, setLoading] = useState(true);
 
-    useEffect(() => {
-        const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-            setUser(currentUser);
-            setLoading(false);
-        });
-        return unsubscribe;
-    }, []);
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setLoading(false);
+      if (user) {
+        router.replace('/dashboard');
+      } else {
+        router.replace('/auth');
+      }
+    });
 
-    if (loading) {
-        return (
-            <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
-                <ActivityIndicator size="large" color="#007AFF" />
-            </View>
-        );
-    }
+    return unsubscribe;
+  }, [router]);
 
-    if (user) {
-        return <Redirect href="/dashboard" />;
-    }
+  if (loading) {
+    return (
+      <View style={styles.container}>
+        <ActivityIndicator size="large" color="#34c759" />
+      </View>
+    );
+  }
 
-    return <Redirect href="/auth" />;
+  return null;
 }
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#fff'
+  }
+});

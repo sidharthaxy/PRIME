@@ -29,7 +29,20 @@
     "plugins": [
       "expo-router",
       "expo-dev-client",
-      "@react-native-google-signin/google-signin"
+      "@react-native-google-signin/google-signin",
+      [
+        "@config-plugins/react-native-ble-plx",
+        {
+          "isBackgroundEnabled": true,
+          "modes": [
+            "peripheral",
+            "central"
+          ],
+          "bluetoothAlwaysPermission": "Allow $(PRODUCT_NAME) to connect to bluetooth devices",
+          "bluetoothAlwaysUsageDescription": "Used to set up PRIME energy monitors",
+          "bluetoothPeripheralUsageDescription": "Used to set up PRIME energy monitors"
+        }
+      ]
     ]
   }
 }

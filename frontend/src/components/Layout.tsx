@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { View, StyleSheet, Platform, StatusBar, Text, TouchableOpacity, Dimensions } from 'react-native';
+import React, { useState, useEffect, useRef } from 'react';
+import { View, StyleSheet, Platform, StatusBar, Text, TouchableOpacity, Dimensions, Animated, TouchableWithoutFeedback } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { FontAwesome5 } from '@expo/vector-icons';
 import { router } from 'expo-router';
@@ -9,8 +9,45 @@ import { signOut, User } from 'firebase/auth';
 const { width, height } = Dimensions.get('window');
 
 export default function Layout({ children }: { children: React.ReactNode }) {
-    const [isDrawerOpen, setIsDrawerOpen] = useState(false);
+    const [isMenuOpen, setIsMenuOpen] = useState(false);
+    const [isMenuMounted, setIsMenuMounted] = useState(false);
     const [user, setUser] = useState<User | null>(null);
+
+    const slideAnim = useRef(new Animated.Value(-width)).current;
+    const fadeAnim = useRef(new Animated.Value(0)).current;
+
+    useEffect(() => {
+        if (isMenuOpen) {
+            setIsMenuMounted(true);
+            Animated.parallel([
+                Animated.timing(slideAnim, {
+                    toValue: 0,
+                    duration: 300,
+                    useNativeDriver: true,
+                }),
+                Animated.timing(fadeAnim, {
+                    toValue: 1,
+                    duration: 300,
+                    useNativeDriver: true,
+                })
+            ]).start();
+        } else if (isMenuMounted) {
+            Animated.parallel([
+                Animated.timing(slideAnim, {
+                    toValue: -width,
+                    duration: 250,
+                    useNativeDriver: true,
+                }),
+                Animated.timing(fadeAnim, {
+                    toValue: 0,
+                    duration: 250,
+                    useNativeDriver: true,
+                })
+            ]).start(() => {
+                setIsMenuMounted(false);
+            });
+        }
+    }, [isMenuOpen]);
 
     useEffect(() => {
         const unsubscribe = auth.onAuthStateChanged((currentUser) => {
@@ -22,7 +59,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
     const handleLogout = async () => {
         try {
             await signOut(auth);
-            setIsDrawerOpen(false);
+            setIsMenuOpen(false);
             router.replace('/auth');
         } catch (error) {
             console.error('Error signing out:', error);
@@ -30,7 +67,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
     };
 
     const navigateTo = (path: any) => {
-        setIsDrawerOpen(false);
+        setIsMenuOpen(false);
         router.push(path);
     };
 
@@ -38,7 +75,11 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         <SafeAreaView style={styles.container}>
             {/* Header */}
             <View style={styles.header}>
-                <TouchableOpacity onPress={() => setIsDrawerOpen(true)} style={styles.hamburgerBtn}>
+                <TouchableOpacity 
+                    onPress={() => setIsMenuOpen(true)} 
+                    style={[styles.hamburgerBtn, !user && { opacity: 0.5 }]}
+                    disabled={!user}
+                >
                     <FontAwesome5 name="bars" size={24} color="#333" />
                 </TouchableOpacity>
                 <Text style={styles.brandText}>PRIME</Text>
@@ -49,10 +90,12 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             </View>
 
             {/* Sidebar Overlay */}
-            {isDrawerOpen && (
+            {isMenuMounted && (
                 <View style={styles.overlayContainer}>
-                    <TouchableOpacity style={styles.backdrop} activeOpacity={1} onPress={() => setIsDrawerOpen(false)} />
-                    <View style={styles.sidebar}>
+                    <TouchableWithoutFeedback onPress={() => setIsMenuOpen(false)}>
+                        <Animated.View style={[styles.backdrop, { opacity: fadeAnim }]} />
+                    </TouchableWithoutFeedback>
+                    <Animated.View style={[styles.sidebar, { transform: [{ translateX: slideAnim }] }]}>
                         <View style={styles.sidebarHeader}>
                             <FontAwesome5 name="user-circle" size={50} color="#007AFF" />
                             <Text style={styles.sidebarUserEmail} numberOfLines={1}>
@@ -94,7 +137,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                                 <Text style={styles.logoutText}>Logout</Text>
                             </TouchableOpacity>
                         </View>
-                    </View>
+                    </Animated.View>
                 </View>
             )}
         </SafeAreaView>
@@ -149,7 +192,7 @@ const styles = StyleSheet.create({
         backgroundColor: 'rgba(0,0,0,0.5)',
     },
     sidebar: {
-        width: width > 400 ? 300 : '75%',
+        width: width > 400 ? 300 : width * 0.75,
         height: '100%',
         backgroundColor: '#fff',
         shadowColor: '#000',
@@ -157,6 +200,10 @@ const styles = StyleSheet.create({
         shadowOpacity: 0.2,
         shadowRadius: 10,
         elevation: 15,
+        position: 'absolute',
+        top: 0,
+        bottom: 0,
+        left: 0,
     },
     sidebarHeader: {
         padding: 30,
