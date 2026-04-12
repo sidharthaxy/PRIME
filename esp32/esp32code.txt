@@ -1,0 +1,386 @@
+// ================== INCLUDES ==================
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <math.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <Preferences.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <ArduinoJson.h>
+#include <time.h>
+
+// ================== MQTT CONFIG ==================
+#define MQTT_HOST "74dcb0592fa54c0aad9ac87e6add3335.s1.eu.hivemq.cloud"
+#define MQTT_PORT 8883
+#define MQTT_USER "prime_worker"
+#define MQTT_PASS "CzP_m3c8s#nHVbx"
+
+// ================== PINS ==================
+#define CURRENT_PIN   34
+#define VOLTAGE_PIN   35
+#define RELAY_PIN     26
+#define BUZZER_PIN    27
+#define LED_NORMAL    25
+#define LED_WARN      33
+#define LED_TRIP      32
+#define BTN_FAULT     18
+#define BTN_PAIR      19
+
+// ================== TIMING ==================
+#define LONG_PRESS_TIME      3000  // ms for factory reset
+#define AUTO_TRIP_SUSTAIN_MS 20000 // 20 s of sustained overpower → auto-trip
+
+// ================== GLOBALS ==================
+Preferences prefs;
+WiFiClientSecure secureClient;
+PubSubClient mqttClient(secureClient);
+String deviceId;
+String cmdTopic; // "devices/<id>/cmd" — subscribed after MQTT connect
+
+// ================== STATE ==================
+enum AppState { STATE_BLE, STATE_RUNNING };
+AppState appState = STATE_BLE;
+
+// ── Button state ──────────────────────────────────────────────────────────────
+unsigned long pressStartTime = 0;
+bool isPressing      = false;
+bool longPressHandled = false;
+
+// ── BLE provisioning ──────────────────────────────────────────────────────────
+bool wifiCredReceived = false;
+String receivedSSID, receivedPass;
+
+// ── Trip / relay state ────────────────────────────────────────────────────────
+// autoTripped  : power exceeded tripWatts for 20 s → relay OFF, buzzer ON
+// manualOff    : remote "trip" command received → relay OFF, no buzzer
+// Either flag cuts the relay. Only autoTripped fires the buzzer.
+bool autoTripped = false;
+bool manualOff   = false;
+bool relayOn     = true; // mirrors actual relay state
+
+// ── Overpower sustain timer ───────────────────────────────────────────────────
+unsigned long overpowerStartMs = 0; // when power first exceeded threshold
+bool overpowerActive = false;       // currently above threshold
+
+// ── Sensor / energy ──────────────────────────────────────────────────────────
+float energy_kWh = 0.0;
+unsigned long lastEnergyMillis  = 0;
+unsigned long lastPublishMillis = 0;
+
+// ================== HELPERS ==================
+
+void setRelay(bool on) {
+  relayOn = on;
+  digitalWrite(RELAY_PIN, on ? HIGH : LOW);
+}
+
+// Buzzer beep pattern — called once on auto-trip
+void alertBuzzer(int beeps = 3) {
+  for (int i = 0; i < beeps; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(300);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(200);
+  }
+}
+
+// ================== SENSOR ==================
+
+float computeRMS_Inverted(int pin, float maxVal) {
+  float sumSq = 0;
+  for (int i = 0; i < 200; i++) {
+    float v = 3.3 - (analogRead(pin) * (3.3 / 4095.0));
+    v -= 1.65;
+    sumSq += v * v;
+    delayMicroseconds(200);
+  }
+  float vrms = sqrt(sumSq / 200);
+  return vrms * (maxVal / 1.65);
+}
+
+// ================== BLE ==================
+
+// ── WiFi Credentials Characteristic (WRITE) ──────────────────────────────────
+class WiFiCredCB : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* c) {
+    StaticJsonDocument<256> doc;
+    if (deserializeJson(doc, c->getValue()) == DeserializationError::Ok) {
+      receivedSSID = doc["ssid"].as<String>();
+      receivedPass = doc["password"].as<String>();
+      wifiCredReceived = true;
+    }
+  }
+};
+
+// ── Device ID Characteristic (READ) ──────────────────────────────────────────
+// Returns the WiFi MAC (= deviceId) so the app knows the ID before pairing.
+class DeviceIdCB : public BLECharacteristicCallbacks {
+  void onRead(BLECharacteristic* c) {
+    c->setValue(deviceId.c_str());
+  }
+};
+
+void startBLE() {
+  BLEDevice::init("PRIME-Setup");
+  BLEServer* server = BLEDevice::createServer();
+  BLEService* svc   = server->createService("12345678-1234-1234-1234-123456789abc");
+
+  // WRITE: WiFi credentials
+  BLECharacteristic* wifiChar = svc->createCharacteristic(
+    "12345678-1234-1234-1234-123456789001",
+    BLECharacteristic::PROPERTY_WRITE
+  );
+  wifiChar->setCallbacks(new WiFiCredCB());
+
+  // READ: Device ID (WiFi MAC without colons)
+  BLECharacteristic* idChar = svc->createCharacteristic(
+    "12345678-1234-1234-1234-123456789003",
+    BLECharacteristic::PROPERTY_READ
+  );
+  idChar->setValue(deviceId.c_str());
+  idChar->setCallbacks(new DeviceIdCB());
+
+  svc->start();
+  BLEDevice::startAdvertising();
+}
+
+// ================== MQTT ==================
+
+// ── Incoming MQTT command handler ─────────────────────────────────────────────
+// Listens on "devices/<id>/cmd" for remote relay control.
+// Commands:
+//   {"cmd":"trip"}    → manual force-off (no buzzer)
+//   {"cmd":"restore"} → turn relay back on (clears autoTripped + manualOff)
+void onMQTTMessage(char* topic, byte* payload, unsigned int length) {
+  String topicStr(topic);
+  if (topicStr != cmdTopic) return; // ignore unrecognised topics
+
+  StaticJsonDocument<128> doc;
+  if (deserializeJson(doc, payload, length) != DeserializationError::Ok) return;
+
+  const char* cmd = doc["cmd"] | "";
+
+  if (strcmp(cmd, "trip") == 0) {
+    // ── Remote force-off ──────────────────────────────────────────────────
+    Serial.println("[CMD] Remote force-off received");
+    manualOff = true;
+    setRelay(false);
+    digitalWrite(LED_TRIP, HIGH);
+    // No buzzer for manual off
+  }
+  else if (strcmp(cmd, "restore") == 0) {
+    // ── Remote restore ───────────────────────────────────────────────────
+    Serial.println("[CMD] Remote restore received");
+    autoTripped        = false;
+    manualOff          = false;
+    overpowerActive    = false;
+    overpowerStartMs   = 0;
+    setRelay(true);
+    digitalWrite(LED_TRIP,   LOW);
+    digitalWrite(LED_NORMAL, HIGH);
+    digitalWrite(BUZZER_PIN, LOW); // ensure buzzer is off
+  }
+}
+
+bool connectMQTT() {
+  secureClient.setInsecure();
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  mqttClient.setCallback(onMQTTMessage); // register command handler
+
+  if (mqttClient.connect(deviceId.c_str(), MQTT_USER, MQTT_PASS)) {
+    // Subscribe to the device-specific command topic
+    cmdTopic = "devices/" + deviceId + "/cmd";
+    mqttClient.subscribe(cmdTopic.c_str());
+    Serial.println("[MQTT] Subscribed to " + cmdTopic);
+    return true;
+  }
+  return false;
+}
+
+// ================== WIFI ==================
+bool connectWiFi(String ssid, String pass) {
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 20) {
+    delay(500);
+    tries++;
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
+// ================== RESET (factory) ==================
+// Long-press (>3s): publishes 'devices/unlink', wipes NVS, reboots.
+void handleReset() {
+  Serial.println("[RESET] Sending unlink");
+
+  if (mqttClient.connected()) {
+    StaticJsonDocument<128> doc;
+    doc["deviceId"] = deviceId;
+    char buf[128];
+    serializeJson(doc, buf);
+    mqttClient.publish("devices/unlink", buf);
+    delay(1000);
+  }
+
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(LED_WARN, HIGH); delay(200);
+    digitalWrite(LED_WARN, LOW);  delay(200);
+  }
+
+  prefs.begin("prime", false);
+  prefs.clear();
+  prefs.end();
+  ESP.restart();
+}
+
+// ================== SETUP ==================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(RELAY_PIN,  OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_NORMAL, OUTPUT);
+  pinMode(LED_WARN,   OUTPUT);
+  pinMode(LED_TRIP,   OUTPUT);
+  pinMode(BTN_PAIR,   INPUT_PULLUP);
+
+  // Relay starts ON (circuit closed / powered)
+  setRelay(true);
+
+  // Compute deviceId from WiFi MAC — works before WiFi.begin()
+  deviceId = WiFi.macAddress();
+  deviceId.replace(":", "");
+
+  prefs.begin("prime", true);
+  String ssid = prefs.getString("ssid", "");
+  String pass = prefs.getString("pass", "");
+  prefs.end();
+
+  if (ssid.length() > 0 && connectWiFi(ssid, pass)) {
+    if (connectMQTT()) {
+      appState = STATE_RUNNING;
+      digitalWrite(LED_NORMAL, HIGH);
+    }
+  } else {
+    startBLE();
+  }
+
+  lastEnergyMillis = millis();
+}
+
+// ================== LOOP ==================
+void loop() {
+
+  // ── Button handling ───────────────────────────────────────────────────────
+  if (digitalRead(BTN_PAIR) == LOW) {
+    if (!isPressing) {
+      pressStartTime = millis();
+      isPressing = true;
+      longPressHandled = false;
+    }
+    if (!longPressHandled && millis() - pressStartTime > LONG_PRESS_TIME) {
+      handleReset();
+      longPressHandled = true;
+    }
+  } else {
+    if (isPressing && !longPressHandled) {
+      Serial.println("Short press -> BLE mode");
+      startBLE();
+    }
+    isPressing = false;
+  }
+
+  // ── BLE provisioning flow ─────────────────────────────────────────────────
+  if (wifiCredReceived) {
+    prefs.begin("prime", false);
+    prefs.putString("ssid", receivedSSID);
+    prefs.putString("pass", receivedPass);
+    prefs.end();
+
+    if (connectWiFi(receivedSSID, receivedPass) && connectMQTT()) {
+      appState = STATE_RUNNING;
+      digitalWrite(LED_NORMAL, HIGH);
+    }
+    wifiCredReceived = false;
+  }
+
+  // ── Running: sensor + MQTT ────────────────────────────────────────────────
+  if (appState == STATE_RUNNING) {
+    mqttClient.loop(); // processes incoming MQTT messages (commands)
+
+    float V = computeRMS_Inverted(VOLTAGE_PIN, 300);
+    float I = computeRMS_Inverted(CURRENT_PIN, 30);
+    float P = V * I;
+
+    // ── 20-second sustained auto-trip logic ──────────────────────────────
+    // Only runs if the circuit is currently on (not already tripped/off).
+    // The tripWatts threshold is enforced here with the hardcoded 2000W
+    // default; the backend stores the per-device tripWatts and does its own
+    // enforcement at the notification level.
+    if (!autoTripped && !manualOff) {
+      if (P > 2000) {
+        if (!overpowerActive) {
+          overpowerActive  = true;
+          overpowerStartMs = millis();
+          digitalWrite(LED_WARN, HIGH); // amber warning while sustaining
+          Serial.printf("[POWER] Overpower started: %.1f W\n", P);
+        } else if (millis() - overpowerStartMs >= AUTO_TRIP_SUSTAIN_MS) {
+          // Sustained for 20 s → auto-trip
+          autoTripped = true;
+          setRelay(false);
+          digitalWrite(LED_WARN,   LOW);
+          digitalWrite(LED_TRIP,   HIGH);
+          digitalWrite(LED_NORMAL, LOW);
+          alertBuzzer(5); // 5 beeps to alert occupants
+          Serial.println("[TRIP] Auto-tripped after 20 s overpower");
+        }
+      } else {
+        // Power back in range — reset overpower timer
+        if (overpowerActive) {
+          overpowerActive = false;
+          overpowerStartMs = 0;
+          digitalWrite(LED_WARN, LOW);
+          Serial.println("[POWER] Overpower cleared");
+        }
+      }
+    }
+
+    // ── LED state ─────────────────────────────────────────────────────────
+    if (autoTripped || manualOff) {
+      digitalWrite(LED_TRIP,   HIGH);
+      digitalWrite(LED_NORMAL, LOW);
+    } else {
+      digitalWrite(LED_NORMAL, HIGH);
+      digitalWrite(LED_TRIP,   LOW);
+    }
+
+    // ── Energy accumulation ───────────────────────────────────────────────
+    float dt = (millis() - lastEnergyMillis) / 3600000.0;
+    if (relayOn) energy_kWh += P * dt; // only accumulate when relay is on
+    lastEnergyMillis = millis();
+
+    // ── Publish telemetry (500 ms interval) ──────────────────────────────
+    // tripReason: "auto" | "manual" | "none"
+    if (millis() - lastPublishMillis > 500) {
+      String tripReason = "none";
+      if (autoTripped) tripReason = "auto";
+      else if (manualOff) tripReason = "manual";
+
+      StaticJsonDocument<300> doc;
+      doc["deviceId"]   = deviceId;
+      doc["power"]      = relayOn ? P : 0; // report 0 when relay off
+      doc["tripped"]    = (autoTripped || manualOff);
+      doc["tripReason"] = tripReason;
+      doc["energy"]     = energy_kWh;
+
+      char buf[300];
+      serializeJson(doc, buf);
+      mqttClient.publish(("devices/" + deviceId + "/data").c_str(), buf);
+      lastPublishMillis = millis();
+    }
+  }
+}
