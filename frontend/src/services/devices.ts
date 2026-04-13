@@ -1,5 +1,8 @@
 import { collection, query, where, onSnapshot, doc, orderBy, limit, Timestamp } from 'firebase/firestore';
-import { db, DeviceDoc, Reading, PairingSession } from '../config/firebase';
+import { ref, onValue, off } from 'firebase/database';
+import { db, rtdb, DeviceDoc, Reading, LiveReading } from '../config/firebase';
+
+// ── Firestore: User's paired devices ─────────────────────────────────────────
 
 export function subscribeToUserDevices(
   uid: string,
@@ -28,6 +31,30 @@ export function subscribeToDevice(
   });
 }
 
+// ── RTDB: Live power reading (updated every 500ms from MQTT) ─────────────────
+// Replaces the old subscribeToLatestReading (Firestore) for the dashboard
+// real-time power display. RTDB has much lower latency for live data.
+
+export function subscribeToLiveReading(
+  deviceId: string,
+  callback: (reading: LiveReading | null) => void
+): () => void {
+  const liveRef = ref(rtdb, `devices/${deviceId}/live`);
+
+  const handler = onValue(liveRef, (snapshot) => {
+    if (snapshot.exists()) {
+      callback(snapshot.val() as LiveReading);
+    } else {
+      callback(null);
+    }
+  });
+
+  // Return an unsubscribe function
+  return () => off(liveRef, 'value', handler);
+}
+
+// ── Firestore: Historical readings ───────────────────────────────────────────
+
 export function subscribeToLatestReading(
   deviceId: string,
   callback: (reading: Reading | null) => void
@@ -42,24 +69,6 @@ export function subscribeToLatestReading(
   return onSnapshot(q, (snapshot) => {
     if (!snapshot.empty) {
       callback(snapshot.docs[0].data() as Reading);
-    } else {
-      callback(null);
-    }
-  });
-}
-
-export function subscribeToPairingSessions(
-  callback: (session: PairingSession | null) => void
-): () => void {
-  const q = query(
-    collection(db, 'pairing_sessions'),
-    where('claimed', '==', false),
-    where('expiresAt', '>', Timestamp.now())
-  );
-  
-  return onSnapshot(q, (snapshot) => {
-    if (!snapshot.empty) {
-      callback(snapshot.docs[0].data() as PairingSession);
     } else {
       callback(null);
     }

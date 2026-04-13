@@ -12,23 +12,20 @@ if (Platform.OS !== 'web') {
 // ── BLE UUIDs (must match ESP32 firmware exactly) ──────────────────
 const SERVICE_UUID   = '12345678-1234-1234-1234-123456789abc';
 const WIFI_CRED_UUID = '12345678-1234-1234-1234-123456789001'; // WRITE
-const STATUS_UUID    = '12345678-1234-1234-1234-123456789002'; // NOTIFY
+const STATUS_UUID    = '12345678-1234-1234-1234-123456789002'; // NOTIFY (reserved, not in firmware yet)
+const DEVICE_ID_UUID = '12345678-1234-1234-1234-123456789003'; // READ  — WiFi MAC = deviceId
 
 // ── Pairing steps ──────────────────────────────────────────────────
-type Step = 'idle' | 'scanning' | 'connecting' | 'wifi_form' | 'provisioning' | 'pairing' | 'done' | 'error';
-
-interface PairingSession {
-  deviceId: string;
-  token: string;
-  name: string;
-}
+// Token verification is removed. New flow:
+//   idle → scanning → connecting → wifi_form → provisioning → done
+type Step = 'idle' | 'scanning' | 'connecting' | 'wifi_form' | 'provisioning' | 'done' | 'error';
 
 interface Props {
-  onPairingRequest?: (session: PairingSession) => Promise<void>;
-  incomingPairingSession?: PairingSession | null;
+  /** Called when WiFi provisioning succeeds; parent shows the DeviceConfigModal */
+  onProvisioningComplete?: (deviceId: string) => void;
 }
 
-export default function MobileScanner({ onPairingRequest, incomingPairingSession: pairingSession }: Props) {
+export default function MobileScanner({ onProvisioningComplete }: Props) {
     const [step, setStep]           = useState<Step>('idle');
     const [statusMsg, setStatusMsg] = useState('Not connected');
     const [devices, setDevices]     = useState<{ id: string, name: string | null }[]>([]);
@@ -37,10 +34,12 @@ export default function MobileScanner({ onPairingRequest, incomingPairingSession
     const [ssid, setSsid]           = useState('');
     const [wifiPass, setWifiPass]   = useState('');
     const [errorMsg, setErrorMsg]   = useState('');
-    const [deviceLabel, setDeviceLabel] = useState('');
+
+    // Internal state: the deviceId read from the ESP32 BLE READ characteristic
+    const pairedDeviceIdRef = useRef<string>('');
 
     // Refs for cleanup
-    const monitorSubRef = useRef<Subscription | null>(null);
+    const monitorSubRef    = useRef<Subscription | null>(null);
     const disconnectSubRef = useRef<Subscription | null>(null);
 
     useEffect(() => {
@@ -72,7 +71,7 @@ export default function MobileScanner({ onPairingRequest, incomingPairingSession
         setSsid('');
         setWifiPass('');
         setErrorMsg('');
-        setDeviceLabel('');
+        pairedDeviceIdRef.current = '';
     };
 
     const requestPermissions = async () => {
@@ -97,7 +96,7 @@ export default function MobileScanner({ onPairingRequest, incomingPairingSession
         return true; 
     };
 
-    // ── Step 1: Scan for Devices ────────────────────────────────────────
+    // ── Step 1: Scan for PRIME Devices ─────────────────────────────────────
     const startScan = async () => {
         if (!bleManager) {
             alert("Native Bluetooth is not supported on the web.");
@@ -111,7 +110,7 @@ export default function MobileScanner({ onPairingRequest, incomingPairingSession
         }
 
         setStep('scanning');
-        setStatusMsg('Scanning for nearby devices...');
+        setStatusMsg('Scanning for nearby PRIME devices...');
         setDevices([]);
 
         bleManager.startDeviceScan(null, null, (error, scannedDevice) => {
@@ -119,8 +118,6 @@ export default function MobileScanner({ onPairingRequest, incomingPairingSession
                 console.warn(error);
                 return;
             }
-
-            // Filter for devices that have a name (you can enforce 'PRIME-Setup' here)
             if (scannedDevice && scannedDevice.name) {
                 setDevices((prevDevices) => {
                     if (!prevDevices.find((d) => d.id === scannedDevice.id)) {
@@ -139,7 +136,7 @@ export default function MobileScanner({ onPairingRequest, incomingPairingSession
         }, 10000);
     };
 
-    // ── Step 2: Connect & Monitor ───────────────────────────────────────
+    // ── Step 2: Connect & Read deviceId ────────────────────────────────────
     const connectToDevice = async (device: { id: string, name: string | null }) => {
         if (!bleManager) return;
         bleManager.stopDeviceScan();
@@ -153,31 +150,29 @@ export default function MobileScanner({ onPairingRequest, incomingPairingSession
             setStatusMsg('Discovering services...');
             await connected.discoverAllServicesAndCharacteristics();
 
-            // Listen for unexpected disconnects
-            disconnectSubRef.current = bleManager.onDeviceDisconnected(device.id, (error, dev) => {
-                setStatusMsg('Disconnected');
-                if (step !== 'done') setError('Device disconnected unexpectedly.');
-            });
-
-            // Start monitoring the STATUS characteristic
-            monitorSubRef.current = bleManager.monitorCharacteristicForDevice(
+            // Read the deviceId from the READ characteristic (WiFi MAC address)
+            setStatusMsg('Reading device ID...');
+            const idCharacteristic = await bleManager.readCharacteristicForDevice(
                 device.id,
                 SERVICE_UUID,
-                STATUS_UUID,
-                (error, characteristic) => {
-                    if (error) {
-                        console.error("Monitor Error:", error);
-                        return;
-                    }
-                    if (characteristic?.value) {
-                        // ble-plx returns base64. We must decode it.
-                        const msg = decodeB64(characteristic.value);
-                        onStatusNotify(msg);
-                    }
-                }
+                DEVICE_ID_UUID,
             );
+            if (idCharacteristic?.value) {
+                const deviceId = decodeB64(idCharacteristic.value);
+                pairedDeviceIdRef.current = deviceId;
+                setStatusMsg(`Connected! Device ID: ${deviceId}`);
+            } else {
+                setStatusMsg('Connected! Enter your WiFi details.');
+            }
 
-            setStatusMsg('Connected! Enter your WiFi details.');
+            // Listen for unexpected disconnects
+            disconnectSubRef.current = bleManager.onDeviceDisconnected(device.id, () => {
+                setStatusMsg('Disconnected');
+                if (step !== 'done' && step !== 'provisioning') {
+                    setError('Device disconnected unexpectedly.');
+                }
+            });
+
             setStep('wifi_form');
 
         } catch (error: any) {
@@ -185,20 +180,7 @@ export default function MobileScanner({ onPairingRequest, incomingPairingSession
         }
     };
 
-    const onStatusNotify = (msg: string) => {
-        setStatusMsg(msg);
-        if (msg === 'WIFI_OK') {
-            setStatusMsg('WiFi connected! Waiting for pairing...');
-            setStep('pairing');
-        } else if (msg === 'WIFI_FAIL') {
-            setStatusMsg('WiFi failed. Check credentials and try again.');
-            setStep('wifi_form');
-        } else if (msg === 'WIFI_CONNECTING') {
-            setStatusMsg('ESP32 is connecting to WiFi...');
-        }
-    };
-
-    // ── Step 3: Send Credentials ────────────────────────────────────────
+    // ── Step 3: Send WiFi Credentials ──────────────────────────────────────
     const sendWifiCredentials = async () => {
         if (!ssid.trim() || !connectedDevice || !bleManager) {
             Alert.alert('Missing Info', 'Please enter your WiFi network name.');
@@ -209,8 +191,7 @@ export default function MobileScanner({ onPairingRequest, incomingPairingSession
             setStep('provisioning');
             setStatusMsg('Sending WiFi credentials to device...');
 
-            const payload = JSON.stringify({ ssid: ssid.trim(), password: wifiPass });
-            // ble-plx requires we send the string as Base64
+            const payload   = JSON.stringify({ ssid: ssid.trim(), password: wifiPass });
             const b64Payload = encodeB64(payload);
 
             await bleManager.writeCharacteristicWithResponseForDevice(
@@ -220,22 +201,19 @@ export default function MobileScanner({ onPairingRequest, incomingPairingSession
                 b64Payload
             );
 
-            setStatusMsg('Credentials sent! Waiting for ESP32 to connect...');
+            // Disconnect BLE — device will now connect to WiFi + MQTT
+            try { await bleManager.cancelDeviceConnection(connectedDevice.id); } catch (_) {}
+
+            setStatusMsg('Credentials sent! Device is connecting to WiFi...');
+            setStep('done');
+
+            // Notify parent so it can show the DeviceConfigModal
+            if (pairedDeviceIdRef.current && onProvisioningComplete) {
+                onProvisioningComplete(pairedDeviceIdRef.current);
+            }
+
         } catch (err: any) {
             setError(`Failed to send credentials: ${err?.message || String(err)}`);
-        }
-    };
-
-    // ── Step 4: Confirm Pairing ─────────────────────────────────────────
-    const confirmPairing = async () => {
-        if (!pairingSession || !onPairingRequest) return;
-        try {
-            setStatusMsg('Confirming pairing...');
-            await onPairingRequest({ ...pairingSession, name: deviceLabel || pairingSession.name });
-            setStep('done');
-            setStatusMsg('Device paired successfully!');
-        } catch (err: any) {
-            setError(`Pairing failed: ${err?.message ?? String(err)}`);
         }
     };
 
@@ -246,7 +224,7 @@ export default function MobileScanner({ onPairingRequest, incomingPairingSession
             {step !== 'error' && step !== 'done' && (
                 <>
                     <View style={styles.progressBar}>
-                        {(['scanning', 'connecting', 'wifi_form', 'provisioning', 'pairing', 'done'] as Step[]).map((s, i) => (
+                        {(['scanning', 'connecting', 'wifi_form', 'provisioning', 'done'] as Step[]).map((s, i) => (
                             <View key={s} style={[styles.progressDot, (step === s || getStepIndex(step) > i) && styles.progressDotActive]} />
                         ))}
                     </View>
@@ -256,13 +234,16 @@ export default function MobileScanner({ onPairingRequest, incomingPairingSession
                             <Text style={styles.label}>Device: <Text style={styles.value}>{connectedDevice.name}</Text></Text>
                         ) : null}
                         <Text style={styles.label}>Status: <Text style={styles.value}>{statusMsg}</Text></Text>
+                        {pairedDeviceIdRef.current ? (
+                            <Text style={styles.label}>ID: <Text style={[styles.value, styles.idText]}>{pairedDeviceIdRef.current}</Text></Text>
+                        ) : null}
                     </View>
                 </>
             )}
 
             {step === 'idle' && (
                 <>
-                    <Text style={styles.hint}>Make sure your ESP32 is powered on and in setup mode.</Text>
+                    <Text style={styles.hint}>Make sure your ESP32 is powered on and in setup mode (blue LED).</Text>
                     <TouchableOpacity style={styles.primaryButton} onPress={startScan}>
                         <Text style={styles.primaryButtonText}>🔍 Scan for PRIME Device</Text>
                     </TouchableOpacity>
@@ -314,42 +295,15 @@ export default function MobileScanner({ onPairingRequest, incomingPairingSession
             {step === 'provisioning' && (
                 <View style={styles.centeredContent}>
                     <ActivityIndicator size="large" color="#007AFF" />
-                    <Text style={styles.hint}>Waiting for ESP32 to connect to WiFi...</Text>
-                </View>
-            )}
-
-            {step === 'pairing' && (
-                <View style={styles.form}>
-                    <Text style={styles.formTitle}>Confirm Pairing</Text>
-                    {pairingSession ? (
-                        <>
-                            <View style={styles.tokenBox}>
-                                <Text style={styles.tokenLabel}>Check this token on your device LCD:</Text>
-                                <Text style={styles.token}>{pairingSession.token}</Text>
-                            </View>
-                            <Text style={styles.formHint}>Give your device a name:</Text>
-                            <TextInput style={styles.input} placeholder={pairingSession.name || 'e.g. Living Room'} value={deviceLabel} onChangeText={setDeviceLabel} />
-                            <TouchableOpacity style={styles.primaryButton} onPress={confirmPairing}>
-                                <Text style={styles.primaryButtonText}>✓ Confirm & Pair</Text>
-                            </TouchableOpacity>
-                            <TouchableOpacity style={styles.secondaryButton} onPress={reset}>
-                                <Text style={styles.secondaryButtonText}>Cancel</Text>
-                            </TouchableOpacity>
-                        </>
-                    ) : (
-                        <>
-                            <ActivityIndicator size="small" color="#007AFF" />
-                            <Text style={styles.hint}>Waiting for device to appear...</Text>
-                            <Text style={styles.formHint}>Press the PAIR button on your ESP32 to broadcast its pairing token.</Text>
-                        </>
-                    )}
+                    <Text style={styles.hint}>Sending WiFi credentials to device...</Text>
                 </View>
             )}
 
             {step === 'done' && (
                 <View style={styles.centeredContent}>
                     <Text style={styles.successIcon}>✅</Text>
-                    <Text style={styles.successText}>{deviceLabel || pairingSession?.name || 'Device'} paired successfully!</Text>
+                    <Text style={styles.successText}>WiFi credentials sent!</Text>
+                    <Text style={styles.hint}>A setup form will appear to complete pairing.</Text>
                     <TouchableOpacity style={styles.primaryButton} onPress={reset}>
                         <Text style={styles.primaryButtonText}>Pair Another Device</Text>
                     </TouchableOpacity>
@@ -370,7 +324,7 @@ export default function MobileScanner({ onPairingRequest, incomingPairingSession
 }
 
 function getStepIndex(step: Step): number {
-    const order: Step[] = ['idle', 'scanning', 'connecting', 'wifi_form', 'provisioning', 'pairing', 'done'];
+    const order: Step[] = ['idle', 'scanning', 'connecting', 'wifi_form', 'provisioning', 'done'];
     return order.indexOf(step);
 }
 
@@ -410,14 +364,12 @@ const styles = StyleSheet.create({
     statusBox: { backgroundColor: '#f2f2f7', padding: 16, borderRadius: 8, width: '100%', marginBottom: 20 },
     label: { fontSize: 14, color: '#6c6c70', fontWeight: '600', marginBottom: 4 },
     value: { color: '#1c1c1e', fontWeight: '400' },
+    idText: { fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 12 },
     hint: { fontSize: 13, color: '#6c6c70', textAlign: 'center', marginBottom: 16, lineHeight: 20 },
     form: { width: '100%', gap: 12 },
     formTitle: { fontSize: 17, fontWeight: '600', color: '#1c1c1e', marginBottom: 4 },
     formHint: { fontSize: 13, color: '#6c6c70', marginBottom: 4 },
     input: { borderWidth: 1, borderColor: '#d1d1d6', borderRadius: 10, paddingVertical: 12, paddingHorizontal: 14, fontSize: 15, backgroundColor: '#f9f9f9', width: '100%' },
-    tokenBox: { backgroundColor: '#e8f4fd', borderRadius: 10, padding: 16, alignItems: 'center', marginBottom: 8 },
-    tokenLabel: { fontSize: 13, color: '#3a7bd5', marginBottom: 8 },
-    token: { fontSize: 36, fontWeight: 'bold', color: '#007AFF', letterSpacing: 8 },
     centeredContent: { alignItems: 'center', gap: 12, width: '100%' },
     successIcon: { fontSize: 48 },
     successText: { fontSize: 17, fontWeight: '600', color: '#34c759', textAlign: 'center' },

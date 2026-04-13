@@ -125,8 +125,7 @@ export default function DeviceDetailRoute() {
     statusColor = '#8e8e93';
     statusText = 'Offline';
   } else if (latestReading) {
-    if (latestReading.status === 1) statusColor = '#ff9500';
-    else if (latestReading.status === 2) statusColor = '#ff3b30';
+    if (latestReading.tripped) statusColor = '#ff3b30';
   }
 
   // Chart Data prep
@@ -181,10 +180,10 @@ export default function DeviceDetailRoute() {
         </View>
 
         {/* Status Banner */}
-        {latestReading && latestReading.status > 0 && (
+        {latestReading && latestReading.tripped && (
           <View style={[styles.banner, { backgroundColor: statusColor }]}>
             <Text style={styles.bannerText}>
-              {latestReading.status === 1 ? '⚠ High Usage Detected' : '🔴 TRIPPED'}
+              🔴 TRIPPED
             </Text>
           </View>
         )}

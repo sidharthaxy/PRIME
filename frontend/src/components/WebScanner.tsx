@@ -5,36 +5,30 @@ import ScanningAnimation from './ScanningAnimation';
 // ── BLE UUIDs (must match ESP32 firmware exactly) ──────────────────
 const SERVICE_UUID   = '12345678-1234-1234-1234-123456789abc';
 const WIFI_CRED_UUID = '12345678-1234-1234-1234-123456789001'; // WRITE
-const STATUS_UUID    = '12345678-1234-1234-1234-123456789002'; // NOTIFY
+const DEVICE_ID_UUID = '12345678-1234-1234-1234-123456789003'; // READ — WiFi MAC = deviceId
 
 // ── Pairing steps ──────────────────────────────────────────────────
-type Step = 'idle' | 'scanning' | 'wifi_form' | 'provisioning' | 'pairing' | 'done' | 'error';
-
-interface PairingSession {
-  deviceId: string;
-  token: string;
-  name: string;
-}
+// Token verification removed. New flow:
+//   idle → scanning → wifi_form → provisioning → done
+type Step = 'idle' | 'scanning' | 'wifi_form' | 'provisioning' | 'done' | 'error';
 
 interface Props {
-  /** Called when pairing completes — hand off deviceId + token to your Firebase callable */
-  onPairingRequest?: (session: PairingSession) => Promise<void>;
-  incomingPairingSession?: PairingSession | null;
+  /** Called when WiFi provisioning succeeds; parent shows the DeviceConfigModal */
+  onProvisioningComplete?: (deviceId: string) => void;
 }
 
-export default function WebScanner({ onPairingRequest, incomingPairingSession: pairingSession }: Props) {
+export default function WebScanner({ onProvisioningComplete }: Props) {
   const [step, setStep]           = useState<Step>('idle');
   const [deviceName, setDeviceName] = useState('');
   const [statusMsg, setStatusMsg] = useState('Not connected');
   const [ssid, setSsid]           = useState('');
   const [wifiPass, setWifiPass]   = useState('');
   const [errorMsg, setErrorMsg]   = useState('');
-  const [deviceLabel, setDeviceLabel] = useState('');
 
   // Keep refs to BLE objects so we can clean up and reuse the connection
   const bleDeviceRef    = useRef<any>(null);
-  const statusCharRef   = useRef<any>(null);
-  const serviceRef      = useRef<any>(null); // Added this to keep the service alive
+  const serviceRef      = useRef<any>(null);
+  const pairedDeviceIdRef = useRef<string>('');
 
   // ── Safety: web only ──────────────────────────────────────────────
   if (Platform.OS !== 'web') {
@@ -59,15 +53,14 @@ export default function WebScanner({ onPairingRequest, incomingPairingSession: p
       bleDeviceRef.current.gatt.disconnect();
     }
     bleDeviceRef.current  = null;
-    statusCharRef.current = null;
-    serviceRef.current    = null; // Reset the service ref
+    serviceRef.current    = null;
+    pairedDeviceIdRef.current = '';
     setStep('idle');
     setDeviceName('');
     setStatusMsg('Not connected');
     setSsid('');
     setWifiPass('');
     setErrorMsg('');
-    setDeviceLabel('');
   };
 
   // ── Step 1: Scan & Connect ────────────────────────────────────────
@@ -92,22 +85,24 @@ export default function WebScanner({ onPairingRequest, incomingPairingSession: p
 
       device.addEventListener('gattserverdisconnected', () => {
         setStatusMsg('Disconnected');
-        if (step !== 'done') setError('Device disconnected unexpectedly. Please try again.');
+        if (step !== 'done' && step !== 'provisioning') {
+          setError('Device disconnected unexpectedly. Please try again.');
+        }
       });
 
       const server  = await device.gatt.connect();
       const service = await server.getPrimaryService(SERVICE_UUID);
-      
-      // Save the service so we don't have to reconnect the GATT server later
       serviceRef.current = service;
 
-      // Subscribe to STATUS notifications
-      const statusChar = await service.getCharacteristic(STATUS_UUID);
-      await statusChar.startNotifications();
-      statusChar.addEventListener('characteristicvaluechanged', onStatusNotify);
-      statusCharRef.current = statusChar;
+      // Read the deviceId from the READ characteristic (WiFi MAC address)
+      setStatusMsg('Reading device ID...');
+      const idChar = await service.getCharacteristic(DEVICE_ID_UUID);
+      const idValue = await idChar.readValue();
+      const decoder = new TextDecoder();
+      const deviceId = decoder.decode(idValue);
+      pairedDeviceIdRef.current = deviceId;
 
-      setStatusMsg('Connected! Enter your WiFi details.');
+      setStatusMsg(`Connected! Device ID: ${deviceId}`);
       setStep('wifi_form');
 
     } catch (err: any) {
@@ -119,29 +114,7 @@ export default function WebScanner({ onPairingRequest, incomingPairingSession: p
     }
   };
 
-  // ── Step 2: Handle STATUS notifications from ESP32 ────────────────
-  const onStatusNotify = (event: any) => {
-    const value   = event.target.value as DataView;
-    const decoder = new TextDecoder();
-    const msg     = decoder.decode(value);
-    setStatusMsg(msg);
-
-    if (msg === 'WIFI_OK') {
-      setStatusMsg('WiFi connected! Waiting for pairing...');
-      setStep('pairing');
-    }
-
-    if (msg === 'WIFI_FAIL') {
-      setStatusMsg('WiFi failed. Check credentials and try again.');
-      setStep('wifi_form'); // let user retry
-    }
-
-    if (msg === 'WIFI_CONNECTING') {
-      setStatusMsg('ESP32 is connecting to WiFi...');
-    }
-  };
-
-  // ── Step 3: Send WiFi credentials over BLE ────────────────────────
+  // ── Step 2: Send WiFi credentials over BLE ────────────────────────
   const sendWifiCredentials = async () => {
     if (!ssid.trim()) {
       Alert.alert('Missing SSID', 'Please enter your WiFi network name.');
@@ -152,7 +125,6 @@ export default function WebScanner({ onPairingRequest, incomingPairingSession: p
       setStep('provisioning');
       setStatusMsg('Sending WiFi credentials to device...');
 
-      // Reuse the active service connection instead of reconnecting
       if (!serviceRef.current) {
          throw new Error("Lost connection to the device's BLE service.");
       }
@@ -163,23 +135,21 @@ export default function WebScanner({ onPairingRequest, incomingPairingSession: p
       
       await wifiChar.writeValue(encoder.encode(payload));
 
-      setStatusMsg('Credentials sent! Waiting for ESP32 to connect...');
+      // Disconnect BLE — device connects to WiFi + MQTT
+      if (bleDeviceRef.current?.gatt?.connected) {
+        bleDeviceRef.current.gatt.disconnect();
+      }
+
+      setStatusMsg('Credentials sent! Device is connecting to WiFi...');
+      setStep('done');
+
+      // Notify parent to show DeviceConfigModal
+      if (pairedDeviceIdRef.current && onProvisioningComplete) {
+        onProvisioningComplete(pairedDeviceIdRef.current);
+      }
 
     } catch (err: any) {
       setError(`Failed to send credentials: ${err?.message ?? String(err)}`);
-    }
-  };
-
-  // ── Step 4: Confirm pairing (called by parent passing session) ────
-  const confirmPairing = async () => {
-    if (!pairingSession || !onPairingRequest) return;
-    try {
-      setStatusMsg('Confirming pairing...');
-      await onPairingRequest({ ...pairingSession, name: deviceLabel || pairingSession.name });
-      setStep('done');
-      setStatusMsg('Device paired successfully!');
-    } catch (err: any) {
-      setError(`Pairing failed: ${err?.message ?? String(err)}`);
     }
   };
 
@@ -187,11 +157,10 @@ export default function WebScanner({ onPairingRequest, incomingPairingSession: p
     <View style={styles.container}>
       <Text style={styles.title}>⚡ PRIME Device Setup</Text>
 
-      {/* Hide Progress and Status boxes if we are in an error state or completely done */}
       {step !== 'error' && step !== 'done' && (
           <>
             <View style={styles.progressBar}>
-              {(['scanning', 'wifi_form', 'provisioning', 'pairing', 'done'] as Step[]).map((s, i) => (
+              {(['scanning', 'wifi_form', 'provisioning', 'done'] as Step[]).map((s, i) => (
                 <View
                   key={s}
                   style={[
@@ -207,6 +176,9 @@ export default function WebScanner({ onPairingRequest, incomingPairingSession: p
                 <Text style={styles.label}>Device: <Text style={styles.value}>{deviceName}</Text></Text>
               ) : null}
               <Text style={styles.label}>Status: <Text style={styles.value}>{statusMsg}</Text></Text>
+              {pairedDeviceIdRef.current ? (
+                <Text style={styles.label}>ID: <Text style={[styles.value, styles.idText]}>{pairedDeviceIdRef.current}</Text></Text>
+              ) : null}
             </View>
           </>
       )}
@@ -276,49 +248,12 @@ export default function WebScanner({ onPairingRequest, incomingPairingSession: p
         </View>
       )}
 
-      {/* ── PAIRING ── */}
-      {step === 'pairing' && (
-        <View style={styles.form}>
-          <Text style={styles.formTitle}>Confirm Pairing</Text>
-          {pairingSession ? (
-            <>
-              <View style={styles.tokenBox}>
-                <Text style={styles.tokenLabel}>Check this token on your device LCD:</Text>
-                <Text style={styles.token}>{pairingSession.token}</Text>
-              </View>
-              <Text style={styles.formHint}>Give your device a name:</Text>
-              <TextInput
-                style={styles.input}
-                placeholder={pairingSession.name || 'e.g. Living Room'}
-                value={deviceLabel}
-                onChangeText={setDeviceLabel}
-              />
-              <TouchableOpacity style={styles.primaryButton} onPress={confirmPairing}>
-                <Text style={styles.primaryButtonText}>✓ Confirm & Pair</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.secondaryButton} onPress={reset}>
-                <Text style={styles.secondaryButtonText}>Cancel</Text>
-              </TouchableOpacity>
-            </>
-          ) : (
-            <>
-              <ActivityIndicator size="small" color="#007AFF" />
-              <Text style={styles.hint}>Waiting for device to appear...</Text>
-              <Text style={styles.formHint}>
-                Press the PAIR button on your ESP32 to broadcast its pairing token.
-              </Text>
-            </>
-          )}
-        </View>
-      )}
-
       {/* ── DONE ── */}
       {step === 'done' && (
         <View style={styles.centeredContent}>
           <Text style={styles.successIcon}>✅</Text>
-          <Text style={styles.successText}>
-            {deviceLabel || pairingSession?.name || 'Device'} paired successfully!
-          </Text>
+          <Text style={styles.successText}>WiFi credentials sent!</Text>
+          <Text style={styles.hint}>A setup form will appear to complete pairing.</Text>
           <TouchableOpacity style={styles.primaryButton} onPress={reset}>
             <Text style={styles.primaryButtonText}>Pair Another Device</Text>
           </TouchableOpacity>
@@ -340,11 +275,10 @@ export default function WebScanner({ onPairingRequest, incomingPairingSession: p
 }
 
 function getStepIndex(step: Step): number {
-  const order: Step[] = ['idle', 'scanning', 'wifi_form', 'provisioning', 'pairing', 'done'];
+  const order: Step[] = ['idle', 'scanning', 'wifi_form', 'provisioning', 'done'];
   return order.indexOf(step);
 }
 
-// ... styles remain exactly the same ...
 const styles = StyleSheet.create({
   container: { padding: 24, backgroundColor: '#ffffff', borderRadius: 16, alignItems: 'center', margin: 20, shadowColor: '#000', shadowOffset: { width: 0, height: 10 }, shadowOpacity: 0.1, shadowRadius: 20, elevation: 5 },
   title: { fontSize: 22, fontWeight: 'bold', marginBottom: 16, color: '#1c1c1e' },
@@ -354,15 +288,13 @@ const styles = StyleSheet.create({
   statusBox: { backgroundColor: '#f2f2f7', padding: 16, borderRadius: 8, width: '100%', marginBottom: 20 },
   label: { fontSize: 14, color: '#6c6c70', fontWeight: '600', marginBottom: 4 },
   value: { color: '#1c1c1e', fontWeight: '400' },
+  idText: { fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 12 },
   hint: { fontSize: 13, color: '#6c6c70', textAlign: 'center', marginBottom: 16, lineHeight: 20 },
   warningText: { fontSize: 13, color: '#ff9500', textAlign: 'center', marginBottom: 12 },
   form: { width: '100%', gap: 12 },
   formTitle: { fontSize: 17, fontWeight: '600', color: '#1c1c1e', marginBottom: 4 },
   formHint: { fontSize: 13, color: '#6c6c70', marginBottom: 4 },
   input: { borderWidth: 1, borderColor: '#d1d1d6', borderRadius: 10, paddingVertical: 12, paddingHorizontal: 14, fontSize: 15, backgroundColor: '#f9f9f9', width: '100%' },
-  tokenBox: { backgroundColor: '#e8f4fd', borderRadius: 10, padding: 16, alignItems: 'center', marginBottom: 8 },
-  tokenLabel: { fontSize: 13, color: '#3a7bd5', marginBottom: 8 },
-  token: { fontSize: 36, fontWeight: 'bold', color: '#007AFF', letterSpacing: 8 },
   centeredContent: { alignItems: 'center', gap: 12, width: '100%' },
   successIcon: { fontSize: 48 },
   successText: { fontSize: 17, fontWeight: '600', color: '#34c759', textAlign: 'center' },

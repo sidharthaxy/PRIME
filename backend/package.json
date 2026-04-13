@@ -10,6 +10,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "dotenv": "^17.4.2",
     "firebase-admin": "^13.6.1",
     "firebase-functions": "^7.0.5"
   }
