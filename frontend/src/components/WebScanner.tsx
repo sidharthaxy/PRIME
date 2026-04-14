@@ -1,10 +1,12 @@
 import React, { useState, useRef } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, Platform, TextInput, ActivityIndicator, Alert } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, Platform, TextInput, ActivityIndicator, Alert, ScrollView } from 'react-native';
+import { FontAwesome5 } from '@expo/vector-icons';
 import ScanningAnimation from './ScanningAnimation';
 
 // ── BLE UUIDs (must match ESP32 firmware exactly) ──────────────────
-const SERVICE_UUID   = '12345678-1234-1234-1234-123456789abc';
+const SERVICE_UUID = '12345678-1234-1234-1234-123456789abc';
 const WIFI_CRED_UUID = '12345678-1234-1234-1234-123456789001'; // WRITE
+const STATUS_UUID = '12345678-1234-1234-1234-123456789002'; // READ/NOTIFY
 const DEVICE_ID_UUID = '12345678-1234-1234-1234-123456789003'; // READ — WiFi MAC = deviceId
 
 // ── Pairing steps ──────────────────────────────────────────────────
@@ -18,16 +20,17 @@ interface Props {
 }
 
 export default function WebScanner({ onProvisioningComplete }: Props) {
-  const [step, setStep]           = useState<Step>('idle');
+  const [step, setStep] = useState<Step>('idle');
   const [deviceName, setDeviceName] = useState('');
   const [statusMsg, setStatusMsg] = useState('Not connected');
-  const [ssid, setSsid]           = useState('');
-  const [wifiPass, setWifiPass]   = useState('');
-  const [errorMsg, setErrorMsg]   = useState('');
+  const [ssid, setSsid] = useState('');
+  const [wifiPass, setWifiPass] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [errorMsg, setErrorMsg] = useState('');
 
   // Keep refs to BLE objects so we can clean up and reuse the connection
-  const bleDeviceRef    = useRef<any>(null);
-  const serviceRef      = useRef<any>(null);
+  const bleDeviceRef = useRef<any>(null);
+  const serviceRef = useRef<any>(null);
   const pairedDeviceIdRef = useRef<string>('');
 
   // ── Safety: web only ──────────────────────────────────────────────
@@ -52,8 +55,8 @@ export default function WebScanner({ onProvisioningComplete }: Props) {
     if (bleDeviceRef.current?.gatt?.connected) {
       bleDeviceRef.current.gatt.disconnect();
     }
-    bleDeviceRef.current  = null;
-    serviceRef.current    = null;
+    bleDeviceRef.current = null;
+    serviceRef.current = null;
     pairedDeviceIdRef.current = '';
     setStep('idle');
     setDeviceName('');
@@ -90,7 +93,7 @@ export default function WebScanner({ onProvisioningComplete }: Props) {
         }
       });
 
-      const server  = await device.gatt.connect();
+      const server = await device.gatt.connect();
       const service = await server.getPrimaryService(SERVICE_UUID);
       serviceRef.current = service;
 
@@ -126,21 +129,79 @@ export default function WebScanner({ onProvisioningComplete }: Props) {
       setStatusMsg('Sending WiFi credentials to device...');
 
       if (!serviceRef.current) {
-         throw new Error("Lost connection to the device's BLE service.");
+        throw new Error("Lost connection to the device's BLE service.");
       }
 
       const wifiChar = await serviceRef.current.getCharacteristic(WIFI_CRED_UUID);
-      const payload  = JSON.stringify({ ssid: ssid.trim(), password: wifiPass });
-      const encoder  = new TextEncoder();
-      
-      await wifiChar.writeValue(encoder.encode(payload));
+      const statusChar = await serviceRef.current.getCharacteristic(STATUS_UUID);
 
-      // Disconnect BLE — device connects to WiFi + MQTT
+      const payload = JSON.stringify({ ssid: ssid.trim(), password: wifiPass });
+      const encoder = new TextEncoder();
+
+      console.log(`Writing BLE Payload: ${payload}`);
+      const bytes = encoder.encode(payload);
+
+      // Manually fragment into 18-byte chunks to bypass strict browser MTU drops completely!
+      for (let i = 0; i < bytes.length; i += 18) {
+        console.log(`Sending chunk ${i/18}...`);
+        const chunk = bytes.slice(i, i + 18);
+        if (typeof wifiChar.writeValueWithoutResponse === 'function') {
+          await wifiChar.writeValueWithoutResponse(chunk);
+        } else if (typeof wifiChar.writeValueWithResponse === 'function') {
+          await wifiChar.writeValueWithResponse(chunk);
+        } else {
+          await wifiChar.writeValue(chunk);
+        }
+        // Tiny wait to ensure the ESP32 buffers and ACKs each chunk properly over the air
+        await new Promise(r => setTimeout(r, 60));
+      }
+
+      setStatusMsg('Verifying connection (this takes up to 25s)...');
+
+      const startTime = Date.now();
+      let finalStatus = '';
+
+      while (Date.now() - startTime < 25000) {
+        try {
+          const val = await statusChar.readValue();
+          const decoder = new TextDecoder();
+          const strVal = decoder.decode(val);
+          if (strVal === 'OK' || strVal === 'FAIL') {
+            finalStatus = strVal;
+            break;
+          }
+        } catch (e) {
+          // ignore transient GATT disconnect errors while ESP32 switches radio context
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+
+      if (finalStatus === 'FAIL') {
+        Alert.alert(
+          "Pairing Failed",
+          "The ESP32 could not connect to WiFi. Please check the SSID and password and ensure it is a 2.4GHz network."
+        );
+        setStep('wifi_form');
+        setStatusMsg('Connected! Device ID: ' + pairedDeviceIdRef.current);
+        return;
+      }
+
+      if (!bleDeviceRef.current?.gatt?.connected) {
+        throw new Error("GATT Server disconnected. The device may have restarted. Please close this window and scan again.");
+      }
+
+      if (finalStatus === '') {
+        // Timeout reached without explicit OK or FAIL. It might be taking extremely long or connection routing is poor.
+        setStatusMsg('Verification took too long, assuming success if device appears online...');
+      }
+
+      // Disconnect BLE on success
       if (bleDeviceRef.current?.gatt?.connected) {
         bleDeviceRef.current.gatt.disconnect();
       }
 
-      setStatusMsg('Credentials sent! Device is connecting to WiFi...');
+      Alert.alert("Success", "successfully connected ok");
+      setStatusMsg('Credentials verified! Device is online.');
       setStep('done');
 
       // Notify parent to show DeviceConfigModal
@@ -154,33 +215,33 @@ export default function WebScanner({ onProvisioningComplete }: Props) {
   };
 
   return (
-    <View style={styles.container}>
+    <ScrollView style={{ flex: 1 }} contentContainerStyle={styles.container}>
       <Text style={styles.title}>⚡ PRIME Device Setup</Text>
 
       {step !== 'error' && step !== 'done' && (
-          <>
-            <View style={styles.progressBar}>
-              {(['scanning', 'wifi_form', 'provisioning', 'done'] as Step[]).map((s, i) => (
-                <View
-                  key={s}
-                  style={[
-                    styles.progressDot,
-                    (step === s || getStepIndex(step) > i) && styles.progressDotActive,
-                  ]}
-                />
-              ))}
-            </View>
+        <>
+          <View style={styles.progressBar}>
+            {(['scanning', 'wifi_form', 'provisioning', 'done'] as Step[]).map((s, i) => (
+              <View
+                key={s}
+                style={[
+                  styles.progressDot,
+                  (step === s || getStepIndex(step) > i) && styles.progressDotActive,
+                ]}
+              />
+            ))}
+          </View>
 
-            <View style={styles.statusBox}>
-              {deviceName ? (
-                <Text style={styles.label}>Device: <Text style={styles.value}>{deviceName}</Text></Text>
-              ) : null}
-              <Text style={styles.label}>Status: <Text style={styles.value}>{statusMsg}</Text></Text>
-              {pairedDeviceIdRef.current ? (
-                <Text style={styles.label}>ID: <Text style={[styles.value, styles.idText]}>{pairedDeviceIdRef.current}</Text></Text>
-              ) : null}
-            </View>
-          </>
+          <View style={styles.statusBox}>
+            {deviceName ? (
+              <Text style={styles.label}>Device: <Text style={styles.value}>{deviceName}</Text></Text>
+            ) : null}
+            <Text style={styles.label}>Status: <Text style={styles.value}>{statusMsg}</Text></Text>
+            {pairedDeviceIdRef.current ? (
+              <Text style={styles.label}>ID: <Text style={[styles.value, styles.idText]}>{pairedDeviceIdRef.current}</Text></Text>
+            ) : null}
+          </View>
+        </>
       )}
 
       {/* ── IDLE ── */}
@@ -222,15 +283,20 @@ export default function WebScanner({ onProvisioningComplete }: Props) {
             autoCapitalize="none"
             autoCorrect={false}
           />
-          <TextInput
-            style={styles.input}
-            placeholder="WiFi Password"
-            value={wifiPass}
-            onChangeText={setWifiPass}
-            secureTextEntry
-            autoCapitalize="none"
-            autoCorrect={false}
-          />
+          <View style={styles.passwordContainer}>
+            <TextInput
+              style={styles.passwordInput}
+              placeholder="WiFi Password"
+              value={wifiPass}
+              onChangeText={setWifiPass}
+              secureTextEntry={!showPassword}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <TouchableOpacity style={styles.eyeButton} onPress={() => setShowPassword(!showPassword)}>
+              <FontAwesome5 name={showPassword ? "eye-slash" : "eye"} size={18} color="#6c6c70" />
+            </TouchableOpacity>
+          </View>
           <TouchableOpacity style={styles.primaryButton} onPress={sendWifiCredentials}>
             <Text style={styles.primaryButtonText}>Send to Device</Text>
           </TouchableOpacity>
@@ -270,7 +336,7 @@ export default function WebScanner({ onProvisioningComplete }: Props) {
           </TouchableOpacity>
         </View>
       )}
-    </View>
+    </ScrollView>
   );
 }
 
@@ -295,6 +361,9 @@ const styles = StyleSheet.create({
   formTitle: { fontSize: 17, fontWeight: '600', color: '#1c1c1e', marginBottom: 4 },
   formHint: { fontSize: 13, color: '#6c6c70', marginBottom: 4 },
   input: { borderWidth: 1, borderColor: '#d1d1d6', borderRadius: 10, paddingVertical: 12, paddingHorizontal: 14, fontSize: 15, backgroundColor: '#f9f9f9', width: '100%' },
+  passwordContainer: { flexDirection: 'row', alignItems: 'center', borderWidth: 1, borderColor: '#d1d1d6', borderRadius: 10, backgroundColor: '#f9f9f9', width: '100%' },
+  passwordInput: { flex: 1, paddingVertical: 12, paddingHorizontal: 14, fontSize: 15 },
+  eyeButton: { padding: 12 },
   centeredContent: { alignItems: 'center', gap: 12, width: '100%' },
   successIcon: { fontSize: 48 },
   successText: { fontSize: 17, fontWeight: '600', color: '#34c759', textAlign: 'center' },

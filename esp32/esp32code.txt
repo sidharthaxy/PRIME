@@ -1,25 +1,25 @@
 // ================== INCLUDES ==================
 #include <Wire.h>
-#include <LiquidCrystal_I2C.h>
 #include <math.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <Preferences.h>
+#include <ArduinoJson.h>
+
+// Standard ESP32 BLE (Newer API compatible)
+#include <WiFiManager.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
-#include <ArduinoJson.h>
-#include <time.h>
 
-// ================== MQTT CONFIG ==================
+// ================== CONFIG & PINS ==================
 #define MQTT_HOST "74dcb0592fa54c0aad9ac87e6add3335.s1.eu.hivemq.cloud"
 #define MQTT_PORT 8883
 #define MQTT_USER "prime_worker"
 #define MQTT_PASS "CzP_m3c8s#nHVbx"
 
-// ================== PINS ==================
 #define CURRENT_PIN   34
 #define VOLTAGE_PIN   35
 #define RELAY_PIN     26
@@ -27,48 +27,41 @@
 #define LED_NORMAL    25
 #define LED_WARN      33
 #define LED_TRIP      32
-#define BTN_FAULT     18
 #define BTN_PAIR      19
 
-// ================== TIMING ==================
-#define LONG_PRESS_TIME      3000  // ms for factory reset
-#define AUTO_TRIP_SUSTAIN_MS 20000 // 20 s of sustained overpower → auto-trip
+#define LONG_PRESS_TIME      3000  
+#define AUTO_TRIP_SUSTAIN_MS 20000 
+#define PUBLISH_INTERVAL_MS  500
 
 // ================== GLOBALS ==================
 Preferences prefs;
 WiFiClientSecure secureClient;
 PubSubClient mqttClient(secureClient);
+WiFiManager wm; 
+
 String deviceId;
-String cmdTopic; // "devices/<id>/cmd" — subscribed after MQTT connect
+String cmdTopic; 
 
-// ================== STATE ==================
-enum AppState { STATE_BLE, STATE_RUNNING };
-AppState appState = STATE_BLE;
+enum AppState { STATE_PROVISIONING, STATE_RUNNING };
+AppState appState = STATE_PROVISIONING;
 
-// ── Button state ──────────────────────────────────────────────────────────────
 unsigned long pressStartTime = 0;
-bool isPressing      = false;
+bool isPressing = false;
 bool longPressHandled = false;
-
-// ── BLE provisioning ──────────────────────────────────────────────────────────
 bool wifiCredReceived = false;
 String receivedSSID, receivedPass;
 
-// ── Trip / relay state ────────────────────────────────────────────────────────
-// autoTripped  : power exceeded tripWatts for 20 s → relay OFF, buzzer ON
-// manualOff    : remote "trip" command received → relay OFF, no buzzer
-// Either flag cuts the relay. Only autoTripped fires the buzzer.
+BLECharacteristic* statusChar = nullptr;
+String bleBuffer = ""; // Global buffer for JSON chunking
+
 bool autoTripped = false;
 bool manualOff   = false;
-bool relayOn     = true; // mirrors actual relay state
+bool relayOn     = true; 
+bool overpowerActive = false;
+unsigned long overpowerStartMs = 0;
 
-// ── Overpower sustain timer ───────────────────────────────────────────────────
-unsigned long overpowerStartMs = 0; // when power first exceeded threshold
-bool overpowerActive = false;       // currently above threshold
-
-// ── Sensor / energy ──────────────────────────────────────────────────────────
 float energy_kWh = 0.0;
-unsigned long lastEnergyMillis  = 0;
+unsigned long lastUpdateMillis = 0;
 unsigned long lastPublishMillis = 0;
 
 // ================== HELPERS ==================
@@ -78,7 +71,6 @@ void setRelay(bool on) {
   digitalWrite(RELAY_PIN, on ? HIGH : LOW);
 }
 
-// Buzzer beep pattern — called once on auto-trip
 void alertBuzzer(int beeps = 3) {
   for (int i = 0; i < beeps; i++) {
     digitalWrite(BUZZER_PIN, HIGH);
@@ -88,297 +80,277 @@ void alertBuzzer(int beeps = 3) {
   }
 }
 
-// ================== SENSOR ==================
-
 float computeRMS_Inverted(int pin, float maxVal) {
   float sumSq = 0;
   for (int i = 0; i < 200; i++) {
     float v = 3.3 - (analogRead(pin) * (3.3 / 4095.0));
-    v -= 1.65;
+    v -= 1.65; 
     sumSq += v * v;
     delayMicroseconds(200);
   }
-  float vrms = sqrt(sumSq / 200);
-  return vrms * (maxVal / 1.65);
+  return sqrt(sumSq / 200) * (maxVal / 1.65);
 }
 
-// ================== BLE ==================
+// ================== BLE CALLBACKS ==================
 
-// ── WiFi Credentials Characteristic (WRITE) ──────────────────────────────────
+class ServerCallbacks: public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    Serial.println("📱 BLE Client Connected! Clearing old packet buffers...");
+    bleBuffer = ""; // Reset the buffer completely on a new physical connection
+  }
+  
+  void onDisconnect(BLEServer* pServer) {
+    BLEDevice::startAdvertising();
+    Serial.println("🔌 BLE Client Disconnected. Restarting Advertising...");
+    bleBuffer = "";
+  }
+};
+
 class WiFiCredCB : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* c) {
-    StaticJsonDocument<256> doc;
-    if (deserializeJson(doc, c->getValue()) == DeserializationError::Ok) {
-      receivedSSID = doc["ssid"].as<String>();
-      receivedPass = doc["password"].as<String>();
-      wifiCredReceived = true;
+    std::string value = c->getValue();
+    
+    // Safety dump of incoming raw packet
+    for(int i=0; i < value.length(); i++){
+      bleBuffer += value[i];
+    }
+
+    Serial.println("--- BLE CHUNK ---");
+    Serial.println("Pkt: " + String(value.c_str()));
+    
+    if (bleBuffer.indexOf("}") != -1) {
+      Serial.println("\n📦 ASSEMBLED BLE JSON: [" + bleBuffer + "]");
+      
+      StaticJsonDocument<256> doc;
+      DeserializationError error = deserializeJson(doc, bleBuffer);
+      
+      if (error == DeserializationError::Ok) {
+        receivedSSID = doc["ssid"].as<String>();
+        receivedPass = doc["password"].as<String>();
+        wifiCredReceived = true;
+        Serial.println("✅ WiFi Config Parsed!");
+      } else {
+        Serial.print("❌ JSON Error: ");
+        Serial.println(error.c_str());
+      }
+      bleBuffer = ""; // Wipe after evaluation
     }
   }
 };
 
-// ── Device ID Characteristic (READ) ──────────────────────────────────────────
-// Returns the WiFi MAC (= deviceId) so the app knows the ID before pairing.
-class DeviceIdCB : public BLECharacteristicCallbacks {
-  void onRead(BLECharacteristic* c) {
-    c->setValue(deviceId.c_str());
-  }
-};
+void startDualProvisioning() {
+  Serial.println("🚀 Starting Dual-Stack Provisioning (BLE + WiFiManager)...");
+  
+  // 1. WiFiManager Setup
+  wm.setConfigPortalBlocking(false);
+  wm.startConfigPortal("PRIME-Setup");
 
-void startBLE() {
+  // 2. BLE Setup
   BLEDevice::init("PRIME-Setup");
   BLEServer* server = BLEDevice::createServer();
-  BLEService* svc   = server->createService("12345678-1234-1234-1234-123456789abc");
+  server->setCallbacks(new ServerCallbacks());
+  
+  BLEService* svc = server->createService("12345678-1234-1234-1234-123456789abc");
 
-  // WRITE: WiFi credentials
+  // Credentials Characteristic
   BLECharacteristic* wifiChar = svc->createCharacteristic(
-    "12345678-1234-1234-1234-123456789001",
-    BLECharacteristic::PROPERTY_WRITE
-  );
+                                    "12345678-1234-1234-1234-123456789001", 
+                                    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
+                                   );
   wifiChar->setCallbacks(new WiFiCredCB());
 
-  // READ: Device ID (WiFi MAC without colons)
+  // Device ID Characteristic
   BLECharacteristic* idChar = svc->createCharacteristic(
-    "12345678-1234-1234-1234-123456789003",
-    BLECharacteristic::PROPERTY_READ
-  );
+                                   "12345678-1234-1234-1234-123456789003", 
+                                   BLECharacteristic::PROPERTY_READ
+                                 );
   idChar->setValue(deviceId.c_str());
-  idChar->setCallbacks(new DeviceIdCB());
+
+  // Status Characteristic
+  statusChar = svc->createCharacteristic(
+                                   "12345678-1234-1234-1234-123456789002", 
+                                   BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+                                 );
+  statusChar->setValue("IDLE");
+  statusChar->addDescriptor(new BLE2902());
 
   svc->start();
-  BLEDevice::startAdvertising();
+  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(svc->getUUID());
+  pAdvertising->start();
+  
+  Serial.println("📡 Provisioning Active. Connect to 'PRIME-Setup' WiFi or BLE.");
 }
 
-// ================== MQTT ==================
+// ================== MQTT & LOGIC ==================
 
-// ── Incoming MQTT command handler ─────────────────────────────────────────────
-// Listens on "devices/<id>/cmd" for remote relay control.
-// Commands:
-//   {"cmd":"trip"}    → manual force-off (no buzzer)
-//   {"cmd":"restore"} → turn relay back on (clears autoTripped + manualOff)
 void onMQTTMessage(char* topic, byte* payload, unsigned int length) {
-  String topicStr(topic);
-  if (topicStr != cmdTopic) return; // ignore unrecognised topics
-
   StaticJsonDocument<128> doc;
   if (deserializeJson(doc, payload, length) != DeserializationError::Ok) return;
-
   const char* cmd = doc["cmd"] | "";
 
   if (strcmp(cmd, "trip") == 0) {
-    // ── Remote force-off ──────────────────────────────────────────────────
-    Serial.println("[CMD] Remote force-off received");
-    manualOff = true;
-    setRelay(false);
-    digitalWrite(LED_TRIP, HIGH);
-    // No buzzer for manual off
-  }
-  else if (strcmp(cmd, "restore") == 0) {
-    // ── Remote restore ───────────────────────────────────────────────────
-    Serial.println("[CMD] Remote restore received");
-    autoTripped        = false;
-    manualOff          = false;
-    overpowerActive    = false;
-    overpowerStartMs   = 0;
+    manualOff = true; setRelay(false);
+    Serial.println("🛑 Remote Trip");
+  } else if (strcmp(cmd, "restore") == 0) {
+    autoTripped = false; manualOff = false; overpowerActive = false;
     setRelay(true);
-    digitalWrite(LED_TRIP,   LOW);
-    digitalWrite(LED_NORMAL, HIGH);
-    digitalWrite(BUZZER_PIN, LOW); // ensure buzzer is off
+    Serial.println("🟢 Remote Restore");
   }
 }
 
 bool connectMQTT() {
+  Serial.println("🌐 Connecting to MQTT: " + String(MQTT_HOST));
   secureClient.setInsecure();
+  secureClient.setHandshakeTimeout(30); // CRITICAL: Stop mobile hotspot TLS timeouts
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
-  mqttClient.setCallback(onMQTTMessage); // register command handler
-
+  mqttClient.setCallback(onMQTTMessage);
+  
   if (mqttClient.connect(deviceId.c_str(), MQTT_USER, MQTT_PASS)) {
-    // Subscribe to the device-specific command topic
     cmdTopic = "devices/" + deviceId + "/cmd";
     mqttClient.subscribe(cmdTopic.c_str());
-    Serial.println("[MQTT] Subscribed to " + cmdTopic);
+    Serial.println("✅ MQTT Connected");
     return true;
   }
+  Serial.print("❌ MQTT Connect Failed! State=");
+  Serial.println(mqttClient.state());
   return false;
 }
 
-// ================== WIFI ==================
-bool connectWiFi(String ssid, String pass) {
-  WiFi.begin(ssid.c_str(), pass.c_str());
-  int tries = 0;
-  while (WiFi.status() != WL_CONNECTED && tries < 20) {
-    delay(500);
-    tries++;
-  }
-  return WiFi.status() == WL_CONNECTED;
-}
-
-// ================== RESET (factory) ==================
-// Long-press (>3s): publishes 'devices/unlink', wipes NVS, reboots.
 void handleReset() {
-  Serial.println("[RESET] Sending unlink");
-
-  if (mqttClient.connected()) {
-    StaticJsonDocument<128> doc;
-    doc["deviceId"] = deviceId;
-    char buf[128];
-    serializeJson(doc, buf);
-    mqttClient.publish("devices/unlink", buf);
-    delay(1000);
-  }
-
-  for (int i = 0; i < 5; i++) {
-    digitalWrite(LED_WARN, HIGH); delay(200);
-    digitalWrite(LED_WARN, LOW);  delay(200);
-  }
-
-  prefs.begin("prime", false);
-  prefs.clear();
-  prefs.end();
+  prefs.begin("prime", false); prefs.clear(); prefs.end();
+  wm.resetSettings(); 
+  Serial.println("♻️ Factory Reset! Restarting...");
+  delay(1000);
   ESP.restart();
 }
 
-// ================== SETUP ==================
+// ================== SETUP & LOOP ==================
+
 void setup() {
   Serial.begin(115200);
+  pinMode(RELAY_PIN, OUTPUT); pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_NORMAL, OUTPUT); pinMode(LED_WARN, OUTPUT);
+  pinMode(LED_TRIP, OUTPUT); pinMode(BTN_PAIR, INPUT_PULLUP);
 
-  pinMode(RELAY_PIN,  OUTPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(LED_NORMAL, OUTPUT);
-  pinMode(LED_WARN,   OUTPUT);
-  pinMode(LED_TRIP,   OUTPUT);
-  pinMode(BTN_PAIR,   INPUT_PULLUP);
-
-  // Relay starts ON (circuit closed / powered)
   setRelay(true);
-
-  // Compute deviceId from WiFi MAC — works before WiFi.begin()
-  deviceId = WiFi.macAddress();
-  deviceId.replace(":", "");
+  
+  // Generate Unique ID straight from hardware fuse!
+  uint64_t chipid = ESP.getEfuseMac();
+  char idStr[18];
+  snprintf(idStr, sizeof(idStr), "%04X%08X", (uint16_t)(chipid >> 32), (uint32_t)chipid);
+  deviceId = String(idStr);
 
   prefs.begin("prime", true);
   String ssid = prefs.getString("ssid", "");
   String pass = prefs.getString("pass", "");
   prefs.end();
 
-  if (ssid.length() > 0 && connectWiFi(ssid, pass)) {
-    if (connectMQTT()) {
+  if (ssid.length() > 0) {
+    Serial.println("Trying saved WiFi: " + ssid);
+    // Disconnect cleanly before attempting to ensure no ghost connections 
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    unsigned long startAttempt = millis();
+    // Allow generous 15s for mobile hotspots to assign DHCP internal IPs
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
+      delay(500); Serial.print(".");
+    }
+
+    if (WiFi.status() == WL_CONNECTED && connectMQTT()) {
       appState = STATE_RUNNING;
       digitalWrite(LED_NORMAL, HIGH);
+      Serial.println("\n✅ Running Mode");
+    } else {
+      startDualProvisioning();
     }
   } else {
-    startBLE();
+    startDualProvisioning();
   }
-
-  lastEnergyMillis = millis();
+  lastUpdateMillis = millis();
 }
 
-// ================== LOOP ==================
 void loop() {
-
-  // ── Button handling ───────────────────────────────────────────────────────
+  // 1. Factory Reset Button (Hold 3s)
   if (digitalRead(BTN_PAIR) == LOW) {
-    if (!isPressing) {
-      pressStartTime = millis();
-      isPressing = true;
-      longPressHandled = false;
+    if (!isPressing) { pressStartTime = millis(); isPressing = true; longPressHandled = false; }
+    if (!longPressHandled && (millis() - pressStartTime > LONG_PRESS_TIME)) { 
+      handleReset(); 
+      longPressHandled = true; 
     }
-    if (!longPressHandled && millis() - pressStartTime > LONG_PRESS_TIME) {
-      handleReset();
-      longPressHandled = true;
+  } else { isPressing = false; }
+
+  // 2. Provisioning Mode Loop
+  if (appState == STATE_PROVISIONING) {
+    wm.process(); // Handle WiFi Portal
+
+    if (WiFi.status() == WL_CONNECTED || wifiCredReceived) {
+      String s = wifiCredReceived ? receivedSSID : WiFi.SSID();
+      String p = wifiCredReceived ? receivedPass : WiFi.psk();
+      
+      prefs.begin("prime", false); 
+      prefs.putString("ssid", s); 
+      prefs.putString("pass", p); 
+      prefs.end();
+      
+      if(statusChar) { statusChar->setValue("OK"); statusChar->notify(); }
+      
+      Serial.println("\nCredentials Saved. Rebooting...");
+      delay(1500);
+      ESP.restart();
     }
-  } else {
-    if (isPressing && !longPressHandled) {
-      Serial.println("Short press -> BLE mode");
-      startBLE();
-    }
-    isPressing = false;
   }
 
-  // ── BLE provisioning flow ─────────────────────────────────────────────────
-  if (wifiCredReceived) {
-    prefs.begin("prime", false);
-    prefs.putString("ssid", receivedSSID);
-    prefs.putString("pass", receivedPass);
-    prefs.end();
-
-    if (connectWiFi(receivedSSID, receivedPass) && connectMQTT()) {
-      appState = STATE_RUNNING;
-      digitalWrite(LED_NORMAL, HIGH);
-    }
-    wifiCredReceived = false;
-  }
-
-  // ── Running: sensor + MQTT ────────────────────────────────────────────────
+  // 3. Operational Mode Loop
   if (appState == STATE_RUNNING) {
-    mqttClient.loop(); // processes incoming MQTT messages (commands)
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Wi-Fi Lost! Reconnecting...");
+      WiFi.reconnect();
+      delay(5000); // Give it breathe room to reconnect
+    } else if (!mqttClient.connected()) {
+      static unsigned long lastReconnectAttempt = 0;
+      if (millis() - lastReconnectAttempt > 5000) {
+        lastReconnectAttempt = millis();
+        connectMQTT();
+      }
+    } else {
+      mqttClient.loop();
+    }
+    mqttClient.loop();
 
     float V = computeRMS_Inverted(VOLTAGE_PIN, 300);
     float I = computeRMS_Inverted(CURRENT_PIN, 30);
     float P = V * I;
 
-    // ── 20-second sustained auto-trip logic ──────────────────────────────
-    // Only runs if the circuit is currently on (not already tripped/off).
-    // The tripWatts threshold is enforced here with the hardcoded 2000W
-    // default; the backend stores the per-device tripWatts and does its own
-    // enforcement at the notification level.
+    // Protection Logic
     if (!autoTripped && !manualOff) {
-      if (P > 2000) {
-        if (!overpowerActive) {
-          overpowerActive  = true;
-          overpowerStartMs = millis();
-          digitalWrite(LED_WARN, HIGH); // amber warning while sustaining
-          Serial.printf("[POWER] Overpower started: %.1f W\n", P);
-        } else if (millis() - overpowerStartMs >= AUTO_TRIP_SUSTAIN_MS) {
-          // Sustained for 20 s → auto-trip
-          autoTripped = true;
-          setRelay(false);
-          digitalWrite(LED_WARN,   LOW);
-          digitalWrite(LED_TRIP,   HIGH);
-          digitalWrite(LED_NORMAL, LOW);
-          alertBuzzer(5); // 5 beeps to alert occupants
-          Serial.println("[TRIP] Auto-tripped after 20 s overpower");
+      if (P > 2000) { // 2kW Limit
+        if (!overpowerActive) { overpowerActive = true; overpowerStartMs = millis(); digitalWrite(LED_WARN, HIGH); }
+        else if (millis() - overpowerStartMs >= AUTO_TRIP_SUSTAIN_MS) {
+          autoTripped = true; setRelay(false); alertBuzzer(5);
         }
-      } else {
-        // Power back in range — reset overpower timer
-        if (overpowerActive) {
-          overpowerActive = false;
-          overpowerStartMs = 0;
-          digitalWrite(LED_WARN, LOW);
-          Serial.println("[POWER] Overpower cleared");
-        }
-      }
+      } else { overpowerActive = false; digitalWrite(LED_WARN, LOW); }
     }
 
-    // ── LED state ─────────────────────────────────────────────────────────
-    if (autoTripped || manualOff) {
-      digitalWrite(LED_TRIP,   HIGH);
-      digitalWrite(LED_NORMAL, LOW);
-    } else {
-      digitalWrite(LED_NORMAL, HIGH);
-      digitalWrite(LED_TRIP,   LOW);
-    }
+    digitalWrite(LED_TRIP, (autoTripped || manualOff) ? HIGH : LOW);
+    digitalWrite(LED_NORMAL, (autoTripped || manualOff) ? LOW : HIGH);
 
-    // ── Energy accumulation ───────────────────────────────────────────────
-    float dt = (millis() - lastEnergyMillis) / 3600000.0;
-    if (relayOn) energy_kWh += P * dt; // only accumulate when relay is on
-    lastEnergyMillis = millis();
+    // Telemetry Publishing
+    if (millis() - lastPublishMillis > PUBLISH_INTERVAL_MS) {
+      float intervalHours = (millis() - lastUpdateMillis) / 3600000.0;
+      if (relayOn) energy_kWh += P * intervalHours;
+      lastUpdateMillis = millis();
 
-    // ── Publish telemetry (500 ms interval) ──────────────────────────────
-    // tripReason: "auto" | "manual" | "none"
-    if (millis() - lastPublishMillis > 500) {
-      String tripReason = "none";
-      if (autoTripped) tripReason = "auto";
-      else if (manualOff) tripReason = "manual";
-
-      StaticJsonDocument<300> doc;
-      doc["deviceId"]   = deviceId;
-      doc["power"]      = relayOn ? P : 0; // report 0 when relay off
-      doc["tripped"]    = (autoTripped || manualOff);
-      doc["tripReason"] = tripReason;
-      doc["energy"]     = energy_kWh;
-
-      char buf[300];
-      serializeJson(doc, buf);
+      StaticJsonDocument<256> outDoc;
+      outDoc["deviceId"] = deviceId;
+      outDoc["power"] = relayOn ? P : 0;
+      outDoc["tripped"] = (autoTripped || manualOff);
+      outDoc["energy"] = energy_kWh;
+      
+      char buf[256];
+      serializeJson(outDoc, buf);
       mqttClient.publish(("devices/" + deviceId + "/data").c_str(), buf);
       lastPublishMillis = millis();
     }

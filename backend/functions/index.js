@@ -1,3 +1,4 @@
+require('dotenv').config({ path: __dirname + '/.env' });
 const functions = require("firebase-functions/v1");
 const { onRequest, onCall, HttpsError } = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
