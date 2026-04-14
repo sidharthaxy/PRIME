@@ -19,9 +19,7 @@ service cloud.firestore {
       allow write: if false;
     }
     match /readings/{readingId} {
-      allow read: if request.auth != null
-        && 'ownerId' in resource.data
-        && resource.data.ownerId == request.auth.uid;
+      allow read: if request.auth != null;
       allow write: if false;
     }
     // pairing_sessions collection is no longer used — token flow removed

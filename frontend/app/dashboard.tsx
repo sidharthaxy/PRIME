@@ -523,7 +523,25 @@ export default function DashboardRoute() {
   const handleRestore = (device: DeviceDoc) => {
     setTargetDevice(device);
     setControlError('');
-    setRestoreDialogVisible(true);
+    
+    const isAutoTripped = device.tripReason === 'auto' || liveData[device.deviceId]?.tripReason === 'auto';
+    
+    if (isAutoTripped) {
+      Alert.alert(
+        '⚠️ Overload Detected',
+        'This circuit automatically tripped to prevent an electrical fire because it exceeded the safe 2000W limit.\n\nYou MUST unplug high-drain appliances before restoring power, or it may trip again.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { 
+            text: 'Restore Power', 
+            style: 'destructive',
+            onPress: () => setRestoreDialogVisible(true) 
+          }
+        ]
+      );
+    } else {
+      setRestoreDialogVisible(true);
+    }
   };
 
   const handleRestoreConfirm = async () => {

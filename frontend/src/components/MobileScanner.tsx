@@ -3,6 +3,8 @@ import { View, Text, TouchableOpacity, StyleSheet, FlatList, ActivityIndicator, 
 import { FontAwesome5 } from '@expo/vector-icons';
 import { BleManager, Device, Subscription } from 'react-native-ble-plx';
 import ScanningAnimation from './ScanningAnimation';
+import { rtdb } from '../config/firebase';
+import { ref, get } from 'firebase/database';
 
 // ── Web Safety Initialization ─────────────────────────────────────────
 let bleManager: BleManager | null = null;
@@ -233,15 +235,37 @@ export default function MobileScanner({ onProvisioningComplete }: Props) {
             }
 
             if (finalStatus === '') {
-                // Timeout reached without explicit OK or FAIL. It might be taking extremely long or connection routing is poor.
-                setStatusMsg('Verification took too long, assuming success if device appears online...');
+                setStatusMsg('WiFi verification complete. Waiting for Cloud connection...');
             }
 
-            // Disconnect BLE on success
+            // Disconnect BLE on success so ESP32 isn't blocked by MTU constraints
             try { await bleManager.cancelDeviceConnection(connectedDevice.id); } catch (_) { }
 
-            Alert.alert("Success", "successfully connected ok");
-            setStatusMsg('Credentials verified! Device is online.');
+            setStatusMsg('WiFi Connected! Waiting for device to appear on the Cloud...');
+            let cloudOnline = false;
+            const cloudStartTime = Date.now();
+            
+            while (Date.now() - cloudStartTime < 20000) {
+                try {
+                    const snap = await get(ref(rtdb, `devices/${pairedDeviceIdRef.current}/live`));
+                    if (snap.exists()) {
+                        cloudOnline = true;
+                        break;
+                    }
+                } catch (e) { } // Ignore read errors, wait for next cycle
+                await new Promise(r => setTimeout(r, 1500));
+            }
+
+            if (!cloudOnline) {
+                Alert.alert(
+                    "Cloud Connection Failed", 
+                    "The device successfully connected to your WiFi, but it could not reach the Cloud. Please factory reset the device (hold Pin 19 to GND for 3s) and try again, ensuring your network has internet access."
+                );
+                setStep('idle');
+                return;
+            }
+
+            setStatusMsg('Credentials verified! Device is actively communicating with the Cloud.');
             setStep('done');
 
             // Notify parent so it can show the DeviceConfigModal

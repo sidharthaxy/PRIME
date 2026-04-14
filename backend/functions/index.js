@@ -355,6 +355,36 @@ exports.unpairDevice = onCall(async (request) => {
   // Also clear RTDB live data
   await rtdb.ref(`devices/${deviceId}`).remove();
 
+  // ── Publish reset command to the ESP32 ────────────────────────────────────
+  const cmdPayload = JSON.stringify({ cmd: "reset" });
+  const cmdTopic   = `devices/${deviceId}/cmd`;
+
+  try {
+    await new Promise((resolve, reject) => {
+      const client = mqtt.connect({
+        host:              process.env.MQTT_HOST,
+        port:              8883,
+        protocol:          "mqtts",
+        username:          process.env.MQTT_USER,
+        password:          process.env.MQTT_PASS,
+        rejectUnauthorized: true,
+        clientId:          `backend-unpair-${Date.now()}`
+      });
+
+      client.on("connect", () => {
+        client.publish(cmdTopic, cmdPayload, { qos: 1, retain: false }, (err) => {
+          client.end();
+          if (err) reject(err); else resolve();
+        });
+      });
+      client.on("error", reject);
+      setTimeout(() => { client.end(); reject(new Error("MQTT publish timeout")); }, 8000);
+    });
+  } catch (err) {
+    console.error("Failed to send reset command to device:", err);
+    // Even if MQTT fails (e.g. device is offline), we successfully unpaired it on the cloud.
+  }
+
   return { success: true };
 });
 
