@@ -86,6 +86,12 @@ client.on("message", async (topic, message) => {
         timestamp: admin.firestore.Timestamp.now()
       });
 
+      // 3. Update Device Status to Online
+      await db.collection("devices").doc(deviceId).update({
+        status: 'online',
+        lastSeen: admin.firestore.Timestamp.now()
+      });
+
       console.log(`📡 [${deviceId.slice(-6)}] Power: ${payload.power}W | Tripped: ${payload.tripped}`);
     }
   } catch (err) {

@@ -7,9 +7,11 @@ service cloud.firestore {
     match /devices/{deviceId} {
       // Owner can read their device
       allow read: if request.auth != null
+        && 'ownerId' in resource.data
         && resource.data.ownerId == request.auth.uid;
       // Owner can update name, tripWatts and safeWatts only
       allow update: if request.auth != null
+        && 'ownerId' in resource.data
         && resource.data.ownerId == request.auth.uid
         && request.resource.data.diff(resource.data)
            .affectedKeys().hasOnly(['name', 'tripWatts', 'safeWatts']);
@@ -17,8 +19,7 @@ service cloud.firestore {
       allow write: if false;
     }
     match /readings/{readingId} {
-      allow read: if request.auth != null
-        && resource.data.ownerId == request.auth.uid;
+      allow read: if request.auth != null;
       allow write: if false;
     }
     // pairing_sessions collection is no longer used — token flow removed

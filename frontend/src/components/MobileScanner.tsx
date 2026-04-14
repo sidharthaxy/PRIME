@@ -1,7 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, FlatList, ActivityIndicator, PermissionsAndroid, Platform, TextInput, Alert } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, FlatList, ActivityIndicator, PermissionsAndroid, Platform, TextInput, Alert, ScrollView } from 'react-native';
+import { FontAwesome5 } from '@expo/vector-icons';
 import { BleManager, Device, Subscription } from 'react-native-ble-plx';
 import ScanningAnimation from './ScanningAnimation';
+import { rtdb } from '../config/firebase';
+import { ref, get } from 'firebase/database';
 
 // ── Web Safety Initialization ─────────────────────────────────────────
 let bleManager: BleManager | null = null;
@@ -10,9 +13,9 @@ if (Platform.OS !== 'web') {
 }
 
 // ── BLE UUIDs (must match ESP32 firmware exactly) ──────────────────
-const SERVICE_UUID   = '12345678-1234-1234-1234-123456789abc';
+const SERVICE_UUID = '12345678-1234-1234-1234-123456789abc';
 const WIFI_CRED_UUID = '12345678-1234-1234-1234-123456789001'; // WRITE
-const STATUS_UUID    = '12345678-1234-1234-1234-123456789002'; // NOTIFY (reserved, not in firmware yet)
+const STATUS_UUID = '12345678-1234-1234-1234-123456789002'; // READ/NOTIFY
 const DEVICE_ID_UUID = '12345678-1234-1234-1234-123456789003'; // READ  — WiFi MAC = deviceId
 
 // ── Pairing steps ──────────────────────────────────────────────────
@@ -21,25 +24,26 @@ const DEVICE_ID_UUID = '12345678-1234-1234-1234-123456789003'; // READ  — WiFi
 type Step = 'idle' | 'scanning' | 'connecting' | 'wifi_form' | 'provisioning' | 'done' | 'error';
 
 interface Props {
-  /** Called when WiFi provisioning succeeds; parent shows the DeviceConfigModal */
-  onProvisioningComplete?: (deviceId: string) => void;
+    /** Called when WiFi provisioning succeeds; parent shows the DeviceConfigModal */
+    onProvisioningComplete?: (deviceId: string) => void;
 }
 
 export default function MobileScanner({ onProvisioningComplete }: Props) {
-    const [step, setStep]           = useState<Step>('idle');
+    const [step, setStep] = useState<Step>('idle');
     const [statusMsg, setStatusMsg] = useState('Not connected');
-    const [devices, setDevices]     = useState<{ id: string, name: string | null }[]>([]);
+    const [devices, setDevices] = useState<{ id: string, name: string | null }[]>([]);
     const [connectedDevice, setConnectedDevice] = useState<Device | null>(null);
-    
-    const [ssid, setSsid]           = useState('');
-    const [wifiPass, setWifiPass]   = useState('');
-    const [errorMsg, setErrorMsg]   = useState('');
+
+    const [ssid, setSsid] = useState('');
+    const [wifiPass, setWifiPass] = useState('');
+    const [showPassword, setShowPassword] = useState(false);
+    const [errorMsg, setErrorMsg] = useState('');
 
     // Internal state: the deviceId read from the ESP32 BLE READ characteristic
     const pairedDeviceIdRef = useRef<string>('');
 
     // Refs for cleanup
-    const monitorSubRef    = useRef<Subscription | null>(null);
+    const monitorSubRef = useRef<Subscription | null>(null);
     const disconnectSubRef = useRef<Subscription | null>(null);
 
     useEffect(() => {
@@ -59,11 +63,11 @@ export default function MobileScanner({ onProvisioningComplete }: Props) {
         if (connectedDevice && bleManager) {
             try {
                 await bleManager.cancelDeviceConnection(connectedDevice.id);
-            } catch (e) {}
+            } catch (e) { }
         }
         monitorSubRef.current?.remove();
         disconnectSubRef.current?.remove();
-        
+
         setStep('idle');
         setConnectedDevice(null);
         setDevices([]);
@@ -93,7 +97,7 @@ export default function MobileScanner({ onProvisioningComplete }: Props) {
                 );
             }
         }
-        return true; 
+        return true;
     };
 
     // ── Step 1: Scan for PRIME Devices ─────────────────────────────────────
@@ -146,7 +150,7 @@ export default function MobileScanner({ onProvisioningComplete }: Props) {
         try {
             const connected = await bleManager.connectToDevice(device.id);
             setConnectedDevice(connected);
-            
+
             setStatusMsg('Discovering services...');
             await connected.discoverAllServicesAndCharacteristics();
 
@@ -191,7 +195,7 @@ export default function MobileScanner({ onProvisioningComplete }: Props) {
             setStep('provisioning');
             setStatusMsg('Sending WiFi credentials to device...');
 
-            const payload   = JSON.stringify({ ssid: ssid.trim(), password: wifiPass });
+            const payload = JSON.stringify({ ssid: ssid.trim(), password: wifiPass });
             const b64Payload = encodeB64(payload);
 
             await bleManager.writeCharacteristicWithResponseForDevice(
@@ -201,10 +205,67 @@ export default function MobileScanner({ onProvisioningComplete }: Props) {
                 b64Payload
             );
 
-            // Disconnect BLE — device will now connect to WiFi + MQTT
-            try { await bleManager.cancelDeviceConnection(connectedDevice.id); } catch (_) {}
+            setStatusMsg('Verifying connection (this takes up to 25s)...');
 
-            setStatusMsg('Credentials sent! Device is connecting to WiFi...');
+            const startTime = Date.now();
+            let finalStatus = '';
+
+            while (Date.now() - startTime < 25000) {
+                try {
+                    const charData = await bleManager.readCharacteristicForDevice(connectedDevice.id, SERVICE_UUID, STATUS_UUID);
+                    const strVal = charData.value ? atob(charData.value) : '';
+                    if (strVal === 'OK' || strVal === 'FAIL') {
+                        finalStatus = strVal;
+                        break;
+                    }
+                } catch (e) {
+                    // transient error during polling ignored
+                }
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+
+            if (finalStatus === 'FAIL') {
+                Alert.alert(
+                    "Pairing Failed",
+                    "The ESP32 could not connect to WiFi. Please check the SSID and password and ensure it is a 2.4GHz network."
+                );
+                setStep('wifi_form');
+                setStatusMsg('Connected! Device ID: ' + pairedDeviceIdRef.current);
+                return;
+            }
+
+            if (finalStatus === '') {
+                setStatusMsg('WiFi verification complete. Waiting for Cloud connection...');
+            }
+
+            // Disconnect BLE on success so ESP32 isn't blocked by MTU constraints
+            try { await bleManager.cancelDeviceConnection(connectedDevice.id); } catch (_) { }
+
+            setStatusMsg('WiFi Connected! Waiting for device to appear on the Cloud...');
+            let cloudOnline = false;
+            const cloudStartTime = Date.now();
+            
+            while (Date.now() - cloudStartTime < 20000) {
+                try {
+                    const snap = await get(ref(rtdb, `devices/${pairedDeviceIdRef.current}/live`));
+                    if (snap.exists()) {
+                        cloudOnline = true;
+                        break;
+                    }
+                } catch (e) { } // Ignore read errors, wait for next cycle
+                await new Promise(r => setTimeout(r, 1500));
+            }
+
+            if (!cloudOnline) {
+                Alert.alert(
+                    "Cloud Connection Failed", 
+                    "The device successfully connected to your WiFi, but it could not reach the Cloud. Please factory reset the device (hold Pin 19 to GND for 3s) and try again, ensuring your network has internet access."
+                );
+                setStep('idle');
+                return;
+            }
+
+            setStatusMsg('Credentials verified! Device is actively communicating with the Cloud.');
             setStep('done');
 
             // Notify parent so it can show the DeviceConfigModal
@@ -272,24 +333,37 @@ export default function MobileScanner({ onProvisioningComplete }: Props) {
             )}
 
             {step === 'connecting' && (
-                 <View style={styles.centeredContent}>
+                <View style={styles.centeredContent}>
                     <ActivityIndicator size="large" color="#007AFF" />
-                 </View>
+                </View>
             )}
 
             {step === 'wifi_form' && (
-                <View style={styles.form}>
+                <ScrollView style={{ width: '100%', flex: 1 }} contentContainerStyle={styles.form} showsVerticalScrollIndicator={false}>
                     <Text style={styles.formTitle}>Enter your WiFi details</Text>
                     <Text style={styles.formHint}>The ESP32 will use these to connect to the internet.</Text>
                     <TextInput style={styles.input} placeholder="WiFi Network Name (SSID)" value={ssid} onChangeText={setSsid} autoCapitalize="none" autoCorrect={false} />
-                    <TextInput style={styles.input} placeholder="WiFi Password" value={wifiPass} onChangeText={setWifiPass} secureTextEntry autoCapitalize="none" autoCorrect={false} />
+                    <View style={styles.passwordContainer}>
+                        <TextInput
+                            style={styles.passwordInput}
+                            placeholder="WiFi Password"
+                            value={wifiPass}
+                            onChangeText={setWifiPass}
+                            secureTextEntry={!showPassword}
+                            autoCapitalize="none"
+                            autoCorrect={false}
+                        />
+                        <TouchableOpacity style={styles.eyeButton} onPress={() => setShowPassword(!showPassword)}>
+                            <FontAwesome5 name={showPassword ? "eye-slash" : "eye"} size={18} color="#6c6c70" />
+                        </TouchableOpacity>
+                    </View>
                     <TouchableOpacity style={styles.primaryButton} onPress={sendWifiCredentials}>
                         <Text style={styles.primaryButtonText}>Send to Device</Text>
                     </TouchableOpacity>
                     <TouchableOpacity style={styles.secondaryButton} onPress={reset}>
                         <Text style={styles.secondaryButtonText}>Cancel</Text>
                     </TouchableOpacity>
-                </View>
+                </ScrollView>
             )}
 
             {step === 'provisioning' && (
@@ -334,9 +408,9 @@ const encodeB64 = (input: string = '') => {
     let str = input;
     let output = '';
     for (let block = 0, charCode, i = 0, map = chars;
-    str.charAt(i | 0) || (map = '=', i % 1);
-    output += map.charAt(63 & block >> 8 - i % 1 * 8)) {
-        charCode = str.charCodeAt(i += 3/4);
+        str.charAt(i | 0) || (map = '=', i % 1);
+        output += map.charAt(63 & block >> 8 - i % 1 * 8)) {
+        charCode = str.charCodeAt(i += 3 / 4);
         block = block << 8 | charCode;
     }
     return output;
@@ -347,7 +421,7 @@ const decodeB64 = (input: string = '') => {
     for (let bc = 0, bs = 0, buffer, i = 0;
         buffer = str.charAt(i++);
         ~buffer && (bs = bc % 4 ? bs * 64 + buffer : buffer,
-        bc++ % 4) ? output += String.fromCharCode(255 & bs >> (-2 * bc & 6)) : 0
+            bc++ % 4) ? output += String.fromCharCode(255 & bs >> (-2 * bc & 6)) : 0
     ) {
         buffer = chars.indexOf(buffer);
     }
@@ -370,6 +444,9 @@ const styles = StyleSheet.create({
     formTitle: { fontSize: 17, fontWeight: '600', color: '#1c1c1e', marginBottom: 4 },
     formHint: { fontSize: 13, color: '#6c6c70', marginBottom: 4 },
     input: { borderWidth: 1, borderColor: '#d1d1d6', borderRadius: 10, paddingVertical: 12, paddingHorizontal: 14, fontSize: 15, backgroundColor: '#f9f9f9', width: '100%' },
+    passwordContainer: { flexDirection: 'row', alignItems: 'center', borderWidth: 1, borderColor: '#d1d1d6', borderRadius: 10, backgroundColor: '#f9f9f9', width: '100%' },
+    passwordInput: { flex: 1, paddingVertical: 12, paddingHorizontal: 14, fontSize: 15 },
+    eyeButton: { padding: 12 },
     centeredContent: { alignItems: 'center', gap: 12, width: '100%' },
     successIcon: { fontSize: 48 },
     successText: { fontSize: 17, fontWeight: '600', color: '#34c759', textAlign: 'center' },
