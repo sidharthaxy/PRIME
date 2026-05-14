@@ -598,7 +598,7 @@ export default function DashboardRoute() {
           <View style={styles.netPowerInfo}>
             <Text style={styles.netPowerLabel}>Approx. Cost</Text>
             <Text style={styles.netPowerValue}>
-              ${pricePerHour.toFixed(3)} <Text style={styles.unitText}>/hr</Text>
+              ₹{pricePerHour.toFixed(3)} <Text style={styles.unitText}>/hr</Text>
             </Text>
           </View>
         </View>

@@ -113,6 +113,10 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                                 <FontAwesome5 name="th-large" size={20} color="#555" style={styles.menuIcon} />
                                 <Text style={styles.menuText}>Dashboard</Text>
                             </TouchableOpacity>
+                            <TouchableOpacity style={styles.menuItem} onPress={() => navigateTo('/analytics')}>
+                                <FontAwesome5 name="chart-bar" size={20} color="#555" style={styles.menuIcon} />
+                                <Text style={styles.menuText}>Analytics</Text>
+                            </TouchableOpacity>
                             <TouchableOpacity style={styles.menuItem} onPress={() => navigateTo('/consumption-log')}>
                                 <FontAwesome5 name="chart-line" size={20} color="#555" style={styles.menuIcon} />
                                 <Text style={styles.menuText}>Consumption Log</Text>
